@@ -1,0 +1,17 @@
+# Virtualenv (big, machine-specific, re-creatable from requirements files)
+.venv/
+
+# Secrets - never commit these (we ship .env.example instead)
+.env
+
+# Python bytecode and tool caches
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Local SQLite databases (re-created by the seed script)
+*.db
