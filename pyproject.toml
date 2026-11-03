@@ -1,0 +1,6 @@
+# Shared tool settings for every layer. Dependencies are NOT listed here:
+# they are pinned per layer in <layer>/requirements*.txt.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]   # put the repo root on sys.path, so tests can `import backend.app...`
+addopts = "-ra"      # at the end of a run, summarise every test that did not pass
