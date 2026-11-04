@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel
 
 OrderStatus = Literal["placed", "shipped", "delivered", "cancelled", "refunded"]
+RefundReason = Literal["damaged", "wrong_item", "not_as_described", "changed_mind"]
 
 
 class OrderItem(BaseModel):
@@ -23,3 +24,17 @@ class Order(BaseModel):
     shipped_at: datetime | None  # None until the order ships
     delivered_at: datetime | None  # None until delivered
     items: list[OrderItem]  # models can nest: an order contains its line items
+
+
+class ProductStock(BaseModel):
+    sku: str
+    name: str
+    stock: int  # 0 is a valid answer: the product exists but is out of stock
+
+
+class RefundPolicy(BaseModel):
+    refund_window_days: int  # counted from delivery
+    changed_mind_window_days: int  # the shorter window for the changed_mind reason
+    accepted_reasons: list[RefundReason]
+    approval_threshold_paise: int  # refunds above this need human approval
+    max_refunds_per_order: int

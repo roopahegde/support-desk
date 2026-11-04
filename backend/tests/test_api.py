@@ -133,3 +133,39 @@ def test_unknown_customer_returns_404(client):
 
 def test_customer_non_integer_id_returns_422(client):
     assert client.get("/customers/abc/orders").status_code == 422
+
+
+# --- GET /products/{sku}/stock ---
+
+
+def test_product_stock_returns_the_current_level(client):
+    response = client.get("/products/SPK-200/stock")
+    assert response.status_code == 200
+    assert response.json() == {"sku": "SPK-200", "name": "Bluetooth Speaker", "stock": 25}
+
+
+def test_out_of_stock_product_is_not_an_error(client):
+    response = client.get("/products/KTL-500/stock")
+    assert response.status_code == 200
+    assert response.json()["stock"] == 0
+
+
+def test_unknown_product_returns_404(client):
+    response = client.get("/products/NOPE-1/stock")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Product NOPE-1 not found"}
+
+
+# --- GET /policies/refund ---
+
+
+def test_refund_policy_publishes_the_business_rules(client):
+    response = client.get("/policies/refund")
+    assert response.status_code == 200
+    assert response.json() == {
+        "refund_window_days": 30,
+        "changed_mind_window_days": 7,
+        "accepted_reasons": ["damaged", "wrong_item", "not_as_described", "changed_mind"],
+        "approval_threshold_paise": 1_000_000,
+        "max_refunds_per_order": 1,
+    }

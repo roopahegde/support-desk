@@ -11,7 +11,8 @@ from typing import Annotated
 from fastapi import Depends, FastAPI, HTTPException
 
 from backend.app.db import connect
-from backend.app.models import Order
+from backend.app.models import Order, ProductStock, RefundPolicy
+from backend.app.policy import REFUND_POLICY
 
 app = FastAPI(title="Support Desk API")
 
@@ -97,3 +98,25 @@ def get_customer_orders(customer_id: int, conn: DbConn):
                 }
             )
     return list(orders_by_id.values())  # dicts keep insertion order, so newest first is preserved
+
+
+@app.get("/products/{sku}/stock", response_model=ProductStock)
+def get_product_stock(sku: str, conn: DbConn):
+    """Return how many units of a product are in stock.
+
+    Responds with 404 if the SKU does not exist. A product that is out of
+    stock is not an error: it returns 200 with a stock of 0.
+    """
+    product = conn.execute(
+        "SELECT sku, name, stock FROM products WHERE sku = ?",
+        (sku,),
+    ).fetchone()
+    if product is None:
+        raise HTTPException(status_code=404, detail=f"Product {sku} not found")
+    return dict(product)
+
+
+@app.get("/policies/refund", response_model=RefundPolicy)
+def get_refund_policy():
+    """Return the refund policy that the API applies to refund requests."""
+    return REFUND_POLICY
