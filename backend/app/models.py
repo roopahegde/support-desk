@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 OrderStatus = Literal["placed", "shipped", "delivered", "cancelled", "refunded"]
 RefundReason = Literal["damaged", "wrong_item", "not_as_described", "changed_mind"]
@@ -38,3 +38,19 @@ class RefundPolicy(BaseModel):
     accepted_reasons: list[RefundReason]
     approval_threshold_paise: int  # refunds above this need human approval
     max_refunds_per_order: int
+
+
+class RefundRequest(BaseModel):
+    """The JSON body a client sends. Invalid bodies get a 422 before the endpoint runs."""
+
+    reason: RefundReason
+    amount_paise: int = Field(gt=0)  # gt=0: reject zero and negative refunds
+
+
+class Refund(BaseModel):
+    id: int
+    order_id: int
+    amount_paise: int
+    reason: RefundReason
+    status: Literal["completed", "pending_approval"]
+    created_at: datetime

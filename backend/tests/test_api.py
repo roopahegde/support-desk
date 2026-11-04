@@ -169,3 +169,83 @@ def test_refund_policy_publishes_the_business_rules(client):
         "approval_threshold_paise": 1_000_000,
         "max_refunds_per_order": 1,
     }
+
+
+# --- POST /orders/{id}/refunds ---
+
+VALID_REFUND = {"reason": "damaged", "amount_paise": 349_900}
+
+
+def test_create_refund_returns_201_with_the_refund(client):
+    response = client.post("/orders/1042/refunds", json=VALID_REFUND)
+    assert response.status_code == 201
+    refund = response.json()
+    assert refund["order_id"] == 1042
+    assert refund["amount_paise"] == 349_900
+    assert refund["reason"] == "damaged"
+    assert refund["status"] == "completed"
+    assert "idempotency_key" not in refund  # internal: not part of the response model
+
+
+def test_create_refund_marks_the_order_as_refunded(client):
+    client.post("/orders/1042/refunds", json=VALID_REFUND)
+    assert client.get("/orders/1042").json()["status"] == "refunded"
+
+
+def test_second_refund_for_the_same_order_returns_409(client, db_path):
+    client.post("/orders/1042/refunds", json=VALID_REFUND)
+    response = client.post("/orders/1042/refunds", json=VALID_REFUND)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Order 1042 has already been refunded"}
+
+    conn = connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = 1042").fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
+def test_refund_of_seeded_refunded_order_returns_409(client):
+    response = client.post("/orders/1045/refunds", json=VALID_REFUND)
+    assert response.status_code == 409
+
+
+def test_refund_of_unknown_order_returns_404(client):
+    response = client.post("/orders/9999/refunds", json=VALID_REFUND)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Order 9999 not found"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"reason": "bored", "amount_paise": 100},  # reason not accepted
+        {"reason": "damaged", "amount_paise": 0},  # amount must be above zero
+        {"reason": "damaged", "amount_paise": -100},
+        {"reason": "damaged", "amount_paise": "lots"},  # not a number
+        {"reason": "damaged"},  # amount missing
+        {"amount_paise": 100},  # reason missing
+    ],
+)
+def test_invalid_refund_body_returns_422_and_changes_nothing(client, body):
+    response = client.post("/orders/1042/refunds", json=body)
+    assert response.status_code == 422
+    assert client.get("/orders/1042").json()["status"] == "delivered"
+
+
+def test_failed_status_update_rolls_back_the_refund(client, db_path):
+    # Make the second write fail: a database trigger rejects the order's status change.
+    run_sql(
+        db_path,
+        "CREATE TRIGGER block_update BEFORE UPDATE ON orders"
+        " BEGIN SELECT RAISE(ABORT, 'simulated failure'); END",
+    )
+    # raise_server_exceptions=False: see the 500 a real client would get, not the Python error.
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/orders/1042/refunds", json=VALID_REFUND
+    )
+    assert response.status_code == 500  # a server failure must not look like "already refunded"
+
+    conn = connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = 1042").fetchone()[0]
+    conn.close()
+    assert count == 0  # the INSERT was undone

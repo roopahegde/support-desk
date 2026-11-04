@@ -5,13 +5,15 @@ Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 """
 
 import sqlite3
+import uuid
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
 
 from backend.app.db import connect
-from backend.app.models import Order, ProductStock, RefundPolicy
+from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
 
 app = FastAPI(title="Support Desk API")
@@ -120,3 +122,37 @@ def get_product_stock(sku: str, conn: DbConn):
 def get_refund_policy():
     """Return the refund policy that the API applies to refund requests."""
     return REFUND_POLICY
+
+
+@app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
+def create_refund(order_id: int, refund: RefundRequest, conn: DbConn):
+    """Refund an order and mark it as refunded.
+
+    Responds with 404 if the order does not exist, 409 if it was already
+    refunded, and 422 if the request body is invalid.
+    """
+    order = conn.execute("SELECT id FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if order is None:
+        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Placeholder: Step 3 takes this key from the Idempotency-Key header instead.
+    idempotency_key = str(uuid.uuid4())
+    try:
+        with conn:  # one transaction: both writes succeed, or neither does
+            cursor = conn.execute(
+                "INSERT INTO refunds (order_id, amount_paise, reason, status,"
+                " idempotency_key, created_at) VALUES (?, ?, ?, 'completed', ?, ?)",
+                (order_id, refund.amount_paise, refund.reason, idempotency_key, created_at),
+            )
+            conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
+    except sqlite3.IntegrityError as error:
+        if "refunds.order_id" not in str(error):
+            raise  # some other constraint failed: a server bug, not "already refunded"
+        # UNIQUE(order_id) rejected it. Relying on this, not a prior SELECT, stops two
+        # simultaneous requests from both passing an "already refunded?" check.
+        raise HTTPException(
+            status_code=409, detail=f"Order {order_id} has already been refunded"
+        ) from None
+
+    return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
