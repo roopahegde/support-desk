@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS orders (
     delivered_at TEXT       -- NULL until delivered; the refund window counts from here
 );
 
+-- Find a customer's orders without reading the whole table.
+CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id);
+
 CREATE TABLE IF NOT EXISTS order_items (
     id               INTEGER PRIMARY KEY,
     order_id         INTEGER NOT NULL REFERENCES orders(id),
@@ -43,6 +46,9 @@ CREATE TABLE IF NOT EXISTS order_items (
     quantity         INTEGER NOT NULL CHECK (quantity > 0),
     unit_price_paise INTEGER NOT NULL CHECK (unit_price_paise >= 0)  -- price at time of sale
 );
+
+-- Find an order's items without reading the whole table.
+CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
 
 CREATE TABLE IF NOT EXISTS refunds (
     id              INTEGER PRIMARY KEY,
@@ -59,7 +65,9 @@ CREATE TABLE IF NOT EXISTS refunds (
 
 def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Open a connection with the settings every caller should get."""
-    conn = sqlite3.connect(db_path)
+    # FastAPI may run a request's dependency and endpoint on different threads. That is safe
+    # here because each request has its own connection, used by one thread at a time.
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row  # rows act like dicts: row["status"]
     conn.execute("PRAGMA foreign_keys = ON")  # SQLite leaves FK checks OFF by default
     return conn

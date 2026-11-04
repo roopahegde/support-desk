@@ -2,3 +2,4 @@
 pytest==9.1.1        # test runner
 pytest-cov==7.1.0    # coverage report: which lines did the tests execute?
 ruff==0.16.10        # linter: catches bugs and style issues without running code
+httpx2==2.16.0       # required by FastAPI's TestClient to send requests in tests
