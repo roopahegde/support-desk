@@ -7,13 +7,12 @@ Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 import os
 import secrets
 import sqlite3
-import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.security import APIKeyHeader
 
 from backend.app.db import connect
@@ -144,20 +143,52 @@ def get_refund_policy():
     return REFUND_POLICY
 
 
-@app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
-def create_refund(order_id: int, refund: RefundRequest, conn: DbConn):
-    """Refund an order and mark it as refunded.
+def find_refund_by_key(conn: sqlite3.Connection, idempotency_key: str) -> sqlite3.Row | None:
+    """Return the refund created with this idempotency key, if there is one."""
+    return conn.execute(
+        "SELECT * FROM refunds WHERE idempotency_key = ?",
+        (idempotency_key,),
+    ).fetchone()
 
-    Responds with 404 if the order does not exist, 409 if it was already
-    refunded, and 422 if the request body is invalid.
+
+def replay_refund(existing: sqlite3.Row, order_id: int, refund: RefundRequest) -> dict:
+    """Return the original refund for a retry, or raise a 409 if the key was reused."""
+    is_same_request = (
+        existing["order_id"] == order_id
+        and existing["reason"] == refund.reason
+        and existing["amount_paise"] == refund.amount_paise
+    )
+    if not is_same_request:
+        raise HTTPException(
+            status_code=409, detail="Idempotency key was already used for a different request"
+        )
+    return dict(existing)
+
+
+@app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
+def create_refund(
+    order_id: int,
+    refund: RefundRequest,
+    # FastAPI maps idempotency_key to the Idempotency-Key header. It is required: missing gets a 422.
+    idempotency_key: Annotated[str, Header(min_length=1, max_length=255)],
+    conn: DbConn,
+):
+    """Refund an order and mark it as refunded. Retries with the same key are safe.
+
+    A retry with the same Idempotency-Key and details returns the original refund
+    and changes nothing. Responds with 404 if the order does not exist, 409 if it
+    was already refunded or the key was used for a different request, and 422 if
+    the request is invalid.
     """
+    existing = find_refund_by_key(conn, idempotency_key)
+    if existing is not None:
+        return replay_refund(existing, order_id, refund)
+
     order = conn.execute("SELECT id FROM orders WHERE id = ?", (order_id,)).fetchone()
     if order is None:
         raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
 
     created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    # Placeholder: Step 3 takes this key from the Idempotency-Key header instead.
-    idempotency_key = str(uuid.uuid4())
     try:
         with conn:  # one transaction: both writes succeed, or neither does
             cursor = conn.execute(
@@ -167,10 +198,14 @@ def create_refund(order_id: int, refund: RefundRequest, conn: DbConn):
             )
             conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
     except sqlite3.IntegrityError as error:
-        if "refunds.order_id" not in str(error):
-            raise  # some other constraint failed: a server bug, not "already refunded"
-        # UNIQUE(order_id) rejected it. Relying on this, not a prior SELECT, stops two
-        # simultaneous requests from both passing an "already refunded?" check.
+        if "refunds.order_id" not in str(error) and "refunds.idempotency_key" not in str(error):
+            raise  # some other constraint failed: a server bug, not a duplicate refund
+        # A UNIQUE rule rejected it. Relying on this, not only the checks above, stops two
+        # simultaneous requests from both creating a refund. A racing retry breaks both rules
+        # and SQLite names just one, so look the key up instead of trusting that name.
+        existing = find_refund_by_key(conn, idempotency_key)
+        if existing is not None:
+            return replay_refund(existing, order_id, refund)
         raise HTTPException(
             status_code=409, detail=f"Order {order_id} has already been refunded"
         ) from None

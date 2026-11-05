@@ -186,8 +186,22 @@ def test_refund_policy_publishes_the_business_rules(client):
 VALID_REFUND = {"reason": "damaged", "amount_paise": 349_900}
 
 
+def post_refund(client, order_id=1042, body=VALID_REFUND, key="key-1"):
+    """Send a refund request with an Idempotency-Key header."""
+    return client.post(
+        f"/orders/{order_id}/refunds", json=body, headers={"Idempotency-Key": key}
+    )
+
+
+def count_refunds(db_path, order_id):
+    conn = connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = ?", (order_id,)).fetchone()
+    conn.close()
+    return count[0]
+
+
 def test_create_refund_returns_201_with_the_refund(client):
-    response = client.post("/orders/1042/refunds", json=VALID_REFUND)
+    response = post_refund(client)
     assert response.status_code == 201
     refund = response.json()
     assert refund["order_id"] == 1042
@@ -198,29 +212,25 @@ def test_create_refund_returns_201_with_the_refund(client):
 
 
 def test_create_refund_marks_the_order_as_refunded(client):
-    client.post("/orders/1042/refunds", json=VALID_REFUND)
+    post_refund(client)
     assert client.get("/orders/1042").json()["status"] == "refunded"
 
 
-def test_second_refund_for_the_same_order_returns_409(client, db_path):
-    client.post("/orders/1042/refunds", json=VALID_REFUND)
-    response = client.post("/orders/1042/refunds", json=VALID_REFUND)
+def test_second_refund_with_a_new_key_returns_409(client, db_path):
+    post_refund(client, key="key-1")
+    response = post_refund(client, key="key-2")
     assert response.status_code == 409
     assert response.json() == {"detail": "Order 1042 has already been refunded"}
-
-    conn = connect(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = 1042").fetchone()[0]
-    conn.close()
-    assert count == 1
+    assert count_refunds(db_path, 1042) == 1
 
 
 def test_refund_of_seeded_refunded_order_returns_409(client):
-    response = client.post("/orders/1045/refunds", json=VALID_REFUND)
+    response = post_refund(client, order_id=1045)
     assert response.status_code == 409
 
 
 def test_refund_of_unknown_order_returns_404(client):
-    response = client.post("/orders/9999/refunds", json=VALID_REFUND)
+    response = post_refund(client, order_id=9999)
     assert response.status_code == 404
     assert response.json() == {"detail": "Order 9999 not found"}
 
@@ -237,7 +247,7 @@ def test_refund_of_unknown_order_returns_404(client):
     ],
 )
 def test_invalid_refund_body_returns_422_and_changes_nothing(client, body):
-    response = client.post("/orders/1042/refunds", json=body)
+    response = post_refund(client, body=body)
     assert response.status_code == 422
     assert client.get("/orders/1042").json()["status"] == "delivered"
 
@@ -250,15 +260,106 @@ def test_failed_status_update_rolls_back_the_refund(client, db_path):
         " BEGIN SELECT RAISE(ABORT, 'simulated failure'); END",
     )
     # raise_server_exceptions=False: see the 500 a real client would get, not the Python error.
-    response = TestClient(
-        app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY}
-    ).post("/orders/1042/refunds", json=VALID_REFUND)
+    response = post_refund(
+        TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY})
+    )
     assert response.status_code == 500  # a server failure must not look like "already refunded"
+    assert count_refunds(db_path, 1042) == 0  # the INSERT was undone
 
-    conn = connect(db_path)
-    count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = 1042").fetchone()[0]
-    conn.close()
-    assert count == 0  # the INSERT was undone
+
+# --- Idempotency-Key ---
+
+
+def test_retry_with_the_same_key_returns_the_original_refund(client, db_path):
+    first = post_refund(client)
+    retry = post_refund(client)
+    assert retry.status_code == 201
+    assert retry.json() == first.json()
+    assert count_refunds(db_path, 1042) == 1
+
+
+def test_seeded_refund_can_be_replayed_with_its_key(client):
+    body = {"reason": "damaged", "amount_paise": 129_900}
+    response = post_refund(client, order_id=1045, body=body, key="seed-refund-1045")
+    assert response.status_code == 201
+    assert response.json()["order_id"] == 1045
+
+
+@pytest.mark.parametrize(
+    ("order_id", "body"),
+    [
+        (1042, {"reason": "damaged", "amount_paise": 100}),  # different amount
+        (1042, {"reason": "wrong_item", "amount_paise": 349_900}),  # different reason
+        (1046, VALID_REFUND),  # different order: keys are unique across all refunds
+    ],
+)
+def test_reusing_a_key_for_a_different_request_returns_409(client, db_path, order_id, body):
+    post_refund(client)
+    response = post_refund(client, order_id=order_id, body=body)
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Idempotency key was already used for a different request"}
+    assert count_refunds(db_path, 1046) == 0  # the other order was not refunded
+
+
+def test_missing_idempotency_key_returns_422(client, db_path):
+    response = client.post("/orders/1042/refunds", json=VALID_REFUND)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["header", "idempotency-key"]
+    assert count_refunds(db_path, 1042) == 0
+
+
+@pytest.mark.parametrize("key", ["", "k" * 256])
+def test_empty_or_oversized_idempotency_key_returns_422(client, key):
+    assert post_refund(client, key=key).status_code == 422
+
+
+def test_racing_retry_returns_the_original_refund(client, db_path):
+    first = post_refund(client)
+    use_connection_that_misses_the_first_key_lookup(db_path)
+    retry = post_refund(client)
+    assert retry.status_code == 201
+    assert retry.json() == first.json()
+    assert count_refunds(db_path, 1042) == 1
+
+
+def test_racing_request_with_a_new_key_returns_409(client, db_path):
+    post_refund(client, key="key-1")
+    use_connection_that_misses_the_first_key_lookup(db_path)
+    response = post_refund(client, key="key-2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Order 1042 has already been refunded"}
+    assert count_refunds(db_path, 1042) == 1
+
+
+def use_connection_that_misses_the_first_key_lookup(db_path):
+    """Simulate a race: the request's first key lookup finds nothing, as if it ran just
+    before another request committed, so the request goes on to attempt its INSERT."""
+
+    class MissesFirstLookup:
+        def __init__(self, conn):
+            self.conn = conn
+            self.missed = False
+
+        def execute(self, sql, params=()):
+            if "WHERE idempotency_key" in sql and not self.missed:
+                self.missed = True
+                return self.conn.execute("SELECT 1 WHERE 0")  # an empty result
+            return self.conn.execute(sql, params)
+
+        def __enter__(self):
+            return self.conn.__enter__()
+
+        def __exit__(self, *args):
+            return self.conn.__exit__(*args)
+
+    def get_racing_db():
+        conn = connect(db_path)
+        try:
+            yield MissesFirstLookup(conn)
+        finally:
+            conn.close()
+
+    app.dependency_overrides[get_db] = get_racing_db
 
 
 # --- API-key auth ---
@@ -294,7 +395,7 @@ def test_every_read_endpoint_requires_a_key(anonymous_client, path):
 
 
 def test_refund_without_a_key_is_rejected_and_changes_nothing(anonymous_client):
-    response = anonymous_client.post("/orders/1042/refunds", json=VALID_REFUND)
+    response = post_refund(anonymous_client)  # a valid request in every way except the API key
     assert response.status_code == 401
 
     order = anonymous_client.get("/orders/1042", headers={"X-API-Key": TEST_API_KEY}).json()
