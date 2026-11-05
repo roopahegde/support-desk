@@ -312,10 +312,16 @@ def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
     assert TEST_API_KEY not in response.text
 
 
-def test_server_with_an_empty_key_never_authenticates(anonymous_client, monkeypatch):
+def test_server_with_an_empty_key_is_misconfigured(anonymous_client, monkeypatch):
     monkeypatch.setenv("BACKEND_API_KEY", "")
-    assert anonymous_client.get("/orders/1042").status_code != 200
-    assert anonymous_client.get("/orders/1042", headers={"X-API-Key": ""}).status_code != 200
+    assert anonymous_client.get("/orders/1042").status_code == 500
+    assert anonymous_client.get("/orders/1042", headers={"X-API-Key": ""}).status_code == 500
+
+
+def test_non_ascii_api_key_gets_401_not_a_server_error(anonymous_client):
+    # Bytes, so the test client sends the non-ASCII header exactly as an attacker could.
+    headers = {"X-API-Key": "é".encode("latin-1")}
+    assert anonymous_client.get("/orders/1042", headers=headers).status_code == 401
 
 
 def test_docs_stay_public(anonymous_client):

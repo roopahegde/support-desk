@@ -22,20 +22,21 @@ from backend.app.policy import REFUND_POLICY
 
 load_dotenv()
 
-API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
-def require_api_key(api_key: Annotated[str | None, Depends(API_KEY_HEADER)]) -> None:
+
+def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> None:
+    """Reject the request unless it carries the correct X-API-Key header."""
     expected = os.environ.get("BACKEND_API_KEY")
-    # 1: if expected is missing, raise a 500: the server is misconfigured
-    if expected is None:
+    # A missing or empty key is a server misconfiguration: fail closed, for every request.
+    if not expected:
         raise HTTPException(status_code=500, detail="Server is misconfigured - missing key")
-    # 2: if api_key is missing or wrong, raise a 401
-    if api_key is None or not secrets.compare_digest(api_key, expected):
+    # Compare bytes: compare_digest raises an error on str values with non-ASCII characters.
+    if api_key is None or not secrets.compare_digest(api_key.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 app = FastAPI(title="Support Desk API", dependencies=[Depends(require_api_key)])
-
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
