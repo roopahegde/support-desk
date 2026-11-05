@@ -10,6 +10,7 @@ from backend.app.main import app, get_db
 from backend.app.seed import seed
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+TEST_API_KEY = "test-key"  # not a real secret: it only exists while a test runs
 
 
 @pytest.fixture
@@ -24,8 +25,10 @@ def db_path(tmp_path):
 
 
 @pytest.fixture
-def client(db_path):
-    """A test client whose requests use the temporary database, never support_desk.db."""
+def anonymous_client(db_path, monkeypatch):
+    """A client that sends no API key, using the temporary database, never support_desk.db."""
+    # monkeypatch undoes this after the test, and the tests never depend on a .env file.
+    monkeypatch.setenv("BACKEND_API_KEY", TEST_API_KEY)
 
     def get_test_db():
         conn = connect(db_path)
@@ -37,6 +40,13 @@ def client(db_path):
     app.dependency_overrides[get_db] = get_test_db
     yield TestClient(app)
     app.dependency_overrides.clear()  # don't leak the override into other tests
+
+
+@pytest.fixture
+def client(anonymous_client):
+    """The same client, sending the correct API key on every request."""
+    anonymous_client.headers["X-API-Key"] = TEST_API_KEY
+    return anonymous_client
 
 
 def run_sql(db_path, sql):
@@ -240,12 +250,79 @@ def test_failed_status_update_rolls_back_the_refund(client, db_path):
         " BEGIN SELECT RAISE(ABORT, 'simulated failure'); END",
     )
     # raise_server_exceptions=False: see the 500 a real client would get, not the Python error.
-    response = TestClient(app, raise_server_exceptions=False).post(
-        "/orders/1042/refunds", json=VALID_REFUND
-    )
+    response = TestClient(
+        app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY}
+    ).post("/orders/1042/refunds", json=VALID_REFUND)
     assert response.status_code == 500  # a server failure must not look like "already refunded"
 
     conn = connect(db_path)
     count = conn.execute("SELECT COUNT(*) FROM refunds WHERE order_id = 1042").fetchone()[0]
     conn.close()
     assert count == 0  # the INSERT was undone
+
+
+# --- API-key auth ---
+
+
+def test_correct_api_key_is_accepted(client):
+    assert client.get("/orders/1042").status_code == 200
+
+
+def test_missing_api_key_returns_401(anonymous_client):
+    response = anonymous_client.get("/orders/1042")
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid API key"}
+
+
+def test_wrong_api_key_gets_the_same_401_as_a_missing_one(anonymous_client):
+    response = anonymous_client.get("/orders/1042", headers={"X-API-Key": "wrong"})
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid API key"}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/orders/1042",
+        "/customers/1/orders",
+        "/products/SPK-200/stock",
+        "/policies/refund",
+    ],
+)
+def test_every_read_endpoint_requires_a_key(anonymous_client, path):
+    assert anonymous_client.get(path).status_code == 401
+
+
+def test_refund_without_a_key_is_rejected_and_changes_nothing(anonymous_client):
+    response = anonymous_client.post("/orders/1042/refunds", json=VALID_REFUND)
+    assert response.status_code == 401
+
+    order = anonymous_client.get("/orders/1042", headers={"X-API-Key": TEST_API_KEY}).json()
+    assert order["status"] == "delivered"
+
+
+def test_invalid_id_without_a_key_gets_401_not_validation_details(anonymous_client):
+    assert anonymous_client.get("/orders/abc").status_code == 401
+
+
+def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
+    monkeypatch.delenv("BACKEND_API_KEY")
+    response = client.get("/orders/1042")
+    assert response.status_code == 500
+    assert TEST_API_KEY not in response.text
+
+
+def test_server_with_an_empty_key_never_authenticates(anonymous_client, monkeypatch):
+    monkeypatch.setenv("BACKEND_API_KEY", "")
+    assert anonymous_client.get("/orders/1042").status_code != 200
+    assert anonymous_client.get("/orders/1042", headers={"X-API-Key": ""}).status_code != 200
+
+
+def test_docs_stay_public(anonymous_client):
+    assert anonymous_client.get("/docs").status_code == 200
+    assert anonymous_client.get("/openapi.json").status_code == 200
+
+
+def test_swagger_advertises_the_api_key_header(anonymous_client):
+    schemes = anonymous_client.get("/openapi.json").json()["components"]["securitySchemes"]
+    assert schemes["APIKeyHeader"] == {"type": "apiKey", "in": "header", "name": "X-API-Key"}

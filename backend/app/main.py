@@ -4,19 +4,38 @@ Run from the repo root:  python -m uvicorn backend.app.main:app --reload
 Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 """
 
+import os
+import secrets
 import sqlite3
 import uuid
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from typing import Annotated
 
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import APIKeyHeader
 
 from backend.app.db import connect
 from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
 
-app = FastAPI(title="Support Desk API")
+load_dotenv()
+
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def require_api_key(api_key: Annotated[str | None, Depends(API_KEY_HEADER)]) -> None:
+    expected = os.environ.get("BACKEND_API_KEY")
+    # 1: if expected is missing, raise a 500: the server is misconfigured
+    if expected is None:
+        raise HTTPException(status_code=500, detail="Server is misconfigured - missing key")
+    # 2: if api_key is missing or wrong, raise a 401
+    if api_key is None or not secrets.compare_digest(api_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+app = FastAPI(title="Support Desk API", dependencies=[Depends(require_api_key)])
+
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
