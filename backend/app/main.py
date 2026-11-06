@@ -4,11 +4,13 @@ Run from the repo root:  python -m uvicorn backend.app.main:app --reload
 Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 """
 
+import logging
 import os
 import secrets
 import sqlite3
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
@@ -20,7 +22,12 @@ from backend.app.models import Order, ProductStock, Refund, RefundPolicy, Refund
 from backend.app.policy import REFUND_POLICY
 from backend.app.rules import RefundRuleError, evaluate_refund
 
-load_dotenv()
+logger = logging.getLogger(__name__)
+
+# backend/.env, found from this file's location. A bare load_dotenv() searches from a
+# directory that depends on how the server was started, and misses this file under --reload.
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(ENV_FILE)  # existing environment variables win over the file, as in CI
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -30,7 +37,15 @@ def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> 
     expected = os.environ.get("BACKEND_API_KEY")
     # A missing or empty key is a server misconfiguration: fail closed, for every request.
     if not expected:
-        raise HTTPException(status_code=500, detail="Server is misconfigured - missing key")
+        # The log tells the operator how to fix it. The client only learns it is not at fault.
+        logger.error("BACKEND_API_KEY is not set: add it to %s or the environment", ENV_FILE)
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The server's API-key check is not configured, so no request can be"
+                " authorized. This is a server problem, not a problem with your API key."
+            ),
+        )
     # Compare bytes: compare_digest raises an error on str values with non-ASCII characters.
     if api_key is None or not secrets.compare_digest(api_key.encode(), expected.encode()):
         raise HTTPException(status_code=401, detail="Invalid API key")

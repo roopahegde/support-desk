@@ -1,6 +1,7 @@
 """API tests: real HTTP-style requests through TestClient, against a temporary database."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -542,7 +543,20 @@ def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
     monkeypatch.delenv("BACKEND_API_KEY")
     response = client.get("/orders/1042")
     assert response.status_code == 500
+    assert "not a problem with your API key" in response.json()["detail"]
     assert TEST_API_KEY not in response.text
+
+
+def test_missing_server_key_is_logged_for_the_operator(client, monkeypatch, caplog):
+    monkeypatch.delenv("BACKEND_API_KEY")
+    client.get("/orders/1042")
+    assert "BACKEND_API_KEY is not set" in caplog.text  # caplog: pytest's capture of log output
+
+
+def test_env_file_is_found_from_the_code_not_the_current_directory():
+    from backend.app.main import ENV_FILE
+
+    assert ENV_FILE == Path(__file__).resolve().parent.parent / ".env"  # backend/.env
 
 
 def test_server_with_an_empty_key_is_misconfigured(anonymous_client, monkeypatch):
