@@ -48,3 +48,25 @@ def evaluate_refund(order: Mapping, refund: RefundRequest, now: datetime) -> Ref
     if refund.amount_paise > REFUND_POLICY.approval_threshold_paise:
         return "pending_approval"
     return "completed"
+
+
+# Why each status can't be cancelled, and what the customer can do instead.
+_NOT_CANCELLABLE = {
+    "shipped": "has already shipped, so it can't be cancelled. A refund can be requested after"
+    " it is delivered.",
+    "delivered": "has already been delivered, so it can't be cancelled. A refund can be"
+    " requested instead.",
+    "refunded": "has already been refunded, so it can't be cancelled.",
+}
+
+
+def check_cancellable(order: Mapping) -> None:
+    """Raise PolicyViolation unless the order can be cancelled: only orders not yet shipped can.
+
+    An order that is already cancelled passes, so a repeated cancel request is harmless.
+    """
+    status = order["status"]
+    if status in ("placed", "cancelled"):
+        return
+    fallback = f"can't be cancelled (its status is '{status}')."  # for any future status
+    raise PolicyViolation(f"Order {order['id']} {_NOT_CANCELLABLE.get(status, fallback)}")

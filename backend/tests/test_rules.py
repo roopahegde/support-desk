@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend.app.models import RefundRequest
-from backend.app.rules import PolicyViolation, evaluate_refund
+from backend.app.rules import PolicyViolation, check_cancellable, evaluate_refund
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 
@@ -91,3 +91,37 @@ def test_window_is_checked_before_the_approval_threshold():
     old_big_order = order(delivered_ago=timedelta(days=45), total_paise=5_000_000)
     with pytest.raises(PolicyViolation):
         evaluate_refund(old_big_order, refund(amount_paise=5_000_000), NOW)
+
+
+# --- Cancellation ---
+
+
+@pytest.mark.parametrize("status", ["placed", "cancelled"])
+def test_order_not_yet_shipped_or_already_cancelled_can_be_cancelled(status):
+    check_cancellable(order(status=status, delivered_ago=None))  # raises nothing
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (
+            "shipped",
+            (
+                "Order 1042 has already shipped, so it can't be cancelled. A refund can be"
+                " requested after it is delivered."
+            ),
+        ),
+        (
+            "delivered",
+            (
+                "Order 1042 has already been delivered, so it can't be cancelled. A refund"
+                " can be requested instead."
+            ),
+        ),
+        ("refunded", "Order 1042 has already been refunded, so it can't be cancelled."),
+    ],
+)
+def test_order_that_has_shipped_cannot_be_cancelled(status, message):
+    with pytest.raises(PolicyViolation) as raised:
+        check_cancellable(order(status=status))
+    assert str(raised.value) == message

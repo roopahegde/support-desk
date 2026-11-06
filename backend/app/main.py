@@ -21,7 +21,7 @@ from backend.app.db import connect
 from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
 from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
-from backend.app.rules import PolicyViolation, evaluate_refund
+from backend.app.rules import PolicyViolation, check_cancellable, evaluate_refund
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,11 @@ def get_order(order_id: int, conn: DbConn):  # the int hint makes /orders/abc re
 
     Responds with 404 if the order does not exist.
     """
+    return load_order(conn, order_id)
+
+
+def load_order(conn: sqlite3.Connection, order_id: int) -> dict:
+    """Fetch an order with its line items, or raise a 404."""
     order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if order is None:
         raise ApiError(404, "not_found", f"Order {order_id} not found")
@@ -275,3 +280,34 @@ def create_refund(
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
+
+
+@app.post("/orders/{order_id}/cancel", response_model=Order)
+def cancel_order(order_id: int, conn: DbConn):
+    """Cancel an order that has not shipped yet, and return it.
+
+    Cancelling an order that is already cancelled changes nothing and returns it,
+    so retries are safe. Responds with 404 if the order does not exist, and with
+    422 if it has shipped, been delivered or been refunded.
+    """
+    order = load_order(conn, order_id)
+    try:
+        check_cancellable(order)
+    except PolicyViolation as error:
+        raise ApiError(422, "policy_violation", str(error)) from None
+
+    with conn:
+        # The WHERE clause re-checks the status inside the write itself, so an order that
+        # ships between our read and this update is never cancelled.
+        conn.execute(
+            "UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'placed'",
+            (order_id,),
+        )
+
+    order = load_order(conn, order_id)
+    if order["status"] != "cancelled":  # it changed after we read it, e.g. it just shipped
+        try:
+            check_cancellable(order)
+        except PolicyViolation as error:
+            raise ApiError(422, "policy_violation", str(error)) from None
+    return order

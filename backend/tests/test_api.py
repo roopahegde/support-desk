@@ -638,3 +638,106 @@ def test_swagger_documents_the_standard_error_body(anonymous_client):
     for status in ("401", "422", "500"):
         schema = refund_responses[status]["content"]["application/json"]["schema"]
         assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
+
+
+# --- POST /orders/{id}/cancel ---
+
+
+def test_cancel_an_order_that_has_not_shipped(client):
+    response = client.post("/orders/1048/cancel")
+    assert response.status_code == 200
+    order = response.json()
+    assert order["id"] == 1048
+    assert order["status"] == "cancelled"
+    assert order["items"] == [{"sku": "TSH-101", "quantity": 2, "unit_price_paise": 129_900}]
+    assert client.get("/orders/1048").json()["status"] == "cancelled"
+
+
+def test_cancelling_twice_is_harmless(client):
+    first = client.post("/orders/1048/cancel")
+    second = client.post("/orders/1048/cancel")
+    assert second.status_code == 200
+    assert second.json() == first.json()
+
+
+@pytest.mark.parametrize(
+    ("order_id", "message"),
+    [
+        (
+            1047,
+            (
+                "Order 1047 has already shipped, so it can't be cancelled. A refund can be"
+                " requested after it is delivered."
+            ),
+        ),
+        (
+            1042,
+            (
+                "Order 1042 has already been delivered, so it can't be cancelled. A refund"
+                " can be requested instead."
+            ),
+        ),
+        (1045, "Order 1045 has already been refunded, so it can't be cancelled."),
+    ],
+)
+def test_order_past_placed_cannot_be_cancelled(client, order_id, message):
+    status_before = client.get(f"/orders/{order_id}").json()["status"]
+    response = client.post(f"/orders/{order_id}/cancel")
+    assert response.status_code == 422
+    assert response.json() == error("policy_violation", message)
+    assert client.get(f"/orders/{order_id}").json()["status"] == status_before
+
+
+def test_cancel_unknown_order_returns_404(client):
+    response = client.post("/orders/9999/cancel")
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "Order 9999 not found")
+
+
+def test_cancel_requires_an_api_key(anonymous_client):
+    assert anonymous_client.post("/orders/1048/cancel").status_code == 401
+    order = anonymous_client.get("/orders/1048", headers={"X-API-Key": TEST_API_KEY}).json()
+    assert order["status"] == "placed"
+
+
+def test_cancelled_order_cannot_be_refunded(client):
+    client.post("/orders/1048/cancel")
+    response = post_refund(client, order_id=1048, body={"reason": "damaged", "amount_paise": 100})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "policy_violation"
+    assert "its status is 'cancelled'" in response.json()["error"]["message"]
+
+
+def test_order_that_ships_mid_request_is_not_cancelled(client, db_path):
+    # Simulate a race: the warehouse ships the order after our read, just before our update.
+    class ShipsJustBeforeTheUpdate:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, sql, params=()):
+            if sql.startswith("UPDATE orders SET status = 'cancelled'"):
+                self.conn.execute("UPDATE orders SET status = 'shipped' WHERE id = ?", params[:1])
+            return self.conn.execute(sql, params)
+
+        def __enter__(self):
+            return self.conn.__enter__()
+
+        def __exit__(self, *args):
+            return self.conn.__exit__(*args)
+
+    def get_racing_db():
+        conn = connect(db_path)
+        try:
+            yield ShipsJustBeforeTheUpdate(conn)
+        finally:
+            conn.close()
+
+    app.dependency_overrides[get_db] = get_racing_db
+    response = client.post("/orders/1048/cancel")
+    assert response.status_code == 422
+    assert "has already shipped" in response.json()["error"]["message"]
+
+    conn = connect(db_path)
+    status = conn.execute("SELECT status FROM orders WHERE id = 1048").fetchone()[0]
+    conn.close()
+    assert status == "shipped"  # the shipment won; the order was not cancelled
