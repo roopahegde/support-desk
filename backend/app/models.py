@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 OrderStatus = Literal["placed", "shipped", "delivered", "cancelled", "refunded"]
 RefundReason = Literal["damaged", "wrong_item", "not_as_described", "changed_mind"]
+RefundStatus = Literal["completed", "pending_approval"]
 
 
 class OrderItem(BaseModel):
@@ -52,5 +53,5 @@ class Refund(BaseModel):
     order_id: int
     amount_paise: int
     reason: RefundReason
-    status: Literal["completed", "pending_approval"]
+    status: RefundStatus  # pending_approval: above the threshold, waiting for a human
     created_at: datetime

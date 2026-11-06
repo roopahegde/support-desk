@@ -1,12 +1,12 @@
 """API tests: real HTTP-style requests through TestClient, against a temporary database."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.db import connect, init_db
-from backend.app.main import app, get_db
+from backend.app.main import app, get_db, get_now
 from backend.app.seed import seed
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -38,8 +38,9 @@ def anonymous_client(db_path, monkeypatch):
             conn.close()
 
     app.dependency_overrides[get_db] = get_test_db
+    app.dependency_overrides[get_now] = lambda: NOW  # the same "now" the seed dates are based on
     yield TestClient(app)
-    app.dependency_overrides.clear()  # don't leak the override into other tests
+    app.dependency_overrides.clear()  # don't leak the overrides into other tests
 
 
 @pytest.fixture
@@ -267,6 +268,106 @@ def test_failed_status_update_rolls_back_the_refund(client, db_path):
     assert count_refunds(db_path, 1042) == 0  # the INSERT was undone
 
 
+# --- Refund rules (each rule is unit-tested in test_rules.py; these check the API wiring) ---
+
+
+@pytest.mark.parametrize(
+    ("order_id", "body", "message"),
+    [
+        (
+            1043,
+            VALID_REFUND,
+            (
+                "Order 1043 was delivered 45 days ago. Refunds are only allowed"
+                " within 30 days of delivery."
+            ),
+        ),
+        (
+            1047,
+            VALID_REFUND,
+            (
+                "Order 1047 cannot be refunded because it has not been delivered"
+                " (its status is 'shipped')."
+            ),
+        ),
+        (
+            1048,
+            VALID_REFUND,
+            (
+                "Order 1048 cannot be refunded because it has not been delivered"
+                " (its status is 'placed')."
+            ),
+        ),
+        (
+            1049,
+            {"reason": "changed_mind", "amount_paise": 249_900},
+            (
+                "Order 1049 was delivered 20 days ago. The reason 'changed_mind' is only"
+                " accepted within 7 days of delivery."
+            ),
+        ),
+        (
+            1042,
+            {"reason": "damaged", "amount_paise": 349_901},
+            "The refund amount (349901 paise) is more than the order total (349900 paise).",
+        ),
+    ],
+)
+def test_refund_the_policy_forbids_returns_422_and_changes_nothing(
+    client, db_path, order_id, body, message
+):
+    status_before = client.get(f"/orders/{order_id}").json()["status"]
+    response = post_refund(client, order_id=order_id, body=body)
+    assert response.status_code == 422
+    assert response.json() == {"detail": message}
+    assert count_refunds(db_path, order_id) == 0
+    assert client.get(f"/orders/{order_id}").json()["status"] == status_before
+
+
+def test_damaged_refund_is_still_allowed_after_7_days(client):
+    response = post_refund(client, order_id=1049, body={"reason": "damaged", "amount_paise": 249_900})
+    assert response.status_code == 201
+    assert response.json()["status"] == "completed"
+
+
+def test_large_refund_is_saved_for_approval_without_refunding_the_order(client):
+    body = {"reason": "damaged", "amount_paise": 5_499_900}
+    response = post_refund(client, order_id=1044, body=body)
+    assert response.status_code == 201
+    assert response.json()["status"] == "pending_approval"
+    assert client.get("/orders/1044").json()["status"] == "delivered"  # not refunded yet
+
+
+def test_second_request_for_a_pending_refund_says_it_awaits_approval(client):
+    body = {"reason": "damaged", "amount_paise": 5_499_900}
+    post_refund(client, order_id=1044, body=body, key="key-1")
+    response = post_refund(client, order_id=1044, body=body, key="key-2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Order 1044 already has a refund waiting for human approval"}
+
+
+def test_retry_of_a_pending_refund_returns_it_unchanged(client):
+    body = {"reason": "damaged", "amount_paise": 5_499_900}
+    first = post_refund(client, order_id=1044, body=body)
+    retry = post_refund(client, order_id=1044, body=body)
+    assert retry.status_code == 201
+    assert retry.json() == first.json()
+
+
+def test_refund_uses_the_injected_clock_for_created_at(client):
+    created_at = post_refund(client).json()["created_at"]
+    assert created_at == "2026-10-01T12:00:00Z"
+
+
+def test_retry_after_the_window_still_returns_the_original_refund(client, db_path):
+    # The rules apply when a refund is created. A later retry is not a new refund.
+    first = post_refund(client)
+    app.dependency_overrides[get_now] = lambda: NOW + timedelta(days=60)
+    retry = post_refund(client)
+    assert retry.status_code == 201
+    assert retry.json() == first.json()
+
+
 # --- Idempotency-Key ---
 
 
@@ -313,37 +414,68 @@ def test_empty_or_oversized_idempotency_key_returns_422(client, key):
     assert post_refund(client, key=key).status_code == 422
 
 
-def test_racing_retry_returns_the_original_refund(client, db_path):
+# A race can be lost at two points. Each test hides the checks the losing request ran
+# before the other request committed, so those checks find nothing.
+KEY_LOOKUP = "WHERE idempotency_key"
+ORDER_REFUND_CHECK = "SELECT 1 FROM refunds WHERE order_id"
+
+
+def test_retry_racing_past_the_key_lookup_returns_the_original_refund(client, db_path):
     first = post_refund(client)
-    use_connection_that_misses_the_first_key_lookup(db_path)
+    use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP])
     retry = post_refund(client)
     assert retry.status_code == 201
     assert retry.json() == first.json()
     assert count_refunds(db_path, 1042) == 1
 
 
-def test_racing_request_with_a_new_key_returns_409(client, db_path):
+def test_new_key_racing_past_the_key_lookup_returns_409(client, db_path):
     post_refund(client, key="key-1")
-    use_connection_that_misses_the_first_key_lookup(db_path)
+    use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP])
     response = post_refund(client, key="key-2")
     assert response.status_code == 409
     assert response.json() == {"detail": "Order 1042 has already been refunded"}
     assert count_refunds(db_path, 1042) == 1
 
 
-def use_connection_that_misses_the_first_key_lookup(db_path):
-    """Simulate a race: the request's first key lookup finds nothing, as if it ran just
-    before another request committed, so the request goes on to attempt its INSERT."""
+# Racing all the way to the INSERT means the order was read before the other request
+# committed, so it still looked 'delivered'. A pending refund leaves the order 'delivered',
+# which reproduces that stale read with real data.
+LARGE_REFUND = {"reason": "damaged", "amount_paise": 5_499_900}
 
-    class MissesFirstLookup:
+
+def test_retry_racing_to_the_insert_returns_the_original_refund(client, db_path):
+    first = post_refund(client, order_id=1044, body=LARGE_REFUND)
+    use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP, ORDER_REFUND_CHECK])
+    retry = post_refund(client, order_id=1044, body=LARGE_REFUND)
+    assert retry.status_code == 201
+    assert retry.json() == first.json()
+    assert count_refunds(db_path, 1044) == 1
+
+
+def test_new_key_racing_to_the_insert_returns_409(client, db_path):
+    post_refund(client, order_id=1044, body=LARGE_REFUND, key="key-1")
+    use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP, ORDER_REFUND_CHECK])
+    response = post_refund(client, order_id=1044, body=LARGE_REFUND, key="key-2")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Order 1044 already has a refund waiting for human approval"}
+    assert count_refunds(db_path, 1044) == 1
+
+
+def use_connection_that_misses_first_lookups(db_path, hidden):
+    """Simulate a race: the first run of each hidden query finds nothing, as if it ran just
+    before another request committed. Later runs of the same query see the real data."""
+
+    class MissesFirstLookups:
         def __init__(self, conn):
             self.conn = conn
-            self.missed = False
+            self.missed = set()
 
         def execute(self, sql, params=()):
-            if "WHERE idempotency_key" in sql and not self.missed:
-                self.missed = True
-                return self.conn.execute("SELECT 1 WHERE 0")  # an empty result
+            for fragment in hidden:
+                if fragment in sql and fragment not in self.missed:
+                    self.missed.add(fragment)
+                    return self.conn.execute("SELECT 1 WHERE 0")  # an empty result
             return self.conn.execute(sql, params)
 
         def __enter__(self):
@@ -355,7 +487,7 @@ def use_connection_that_misses_the_first_key_lookup(db_path):
     def get_racing_db():
         conn = connect(db_path)
         try:
-            yield MissesFirstLookup(conn)
+            yield MissesFirstLookups(conn)
         finally:
             conn.close()
 

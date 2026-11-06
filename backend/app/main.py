@@ -18,6 +18,7 @@ from fastapi.security import APIKeyHeader
 from backend.app.db import connect
 from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
+from backend.app.rules import RefundRuleError, evaluate_refund
 
 load_dotenv()
 
@@ -49,6 +50,14 @@ def get_db() -> Iterator[sqlite3.Connection]:
 
 # An endpoint parameter of this type receives the connection from get_db.
 DbConn = Annotated[sqlite3.Connection, Depends(get_db)]
+
+
+def get_now() -> datetime:
+    """The current time in UTC. Tests override this to freeze the clock."""
+    return datetime.now(timezone.utc)
+
+
+Now = Annotated[datetime, Depends(get_now)]
 
 
 # response_model: FastAPI validates the return value against Order and documents it in Swagger.
@@ -165,6 +174,30 @@ def replay_refund(existing: sqlite3.Row, order_id: int, refund: RefundRequest) -
     return dict(existing)
 
 
+def already_refunded_error(conn: sqlite3.Connection, order_id: int) -> HTTPException:
+    """A 409 that says whether the order's existing refund is done or waiting for approval."""
+    existing = conn.execute(
+        "SELECT status FROM refunds WHERE order_id = ?", (order_id,)
+    ).fetchone()
+    if existing is not None and existing["status"] == "pending_approval":
+        return HTTPException(
+            status_code=409,
+            detail=f"Order {order_id} already has a refund waiting for human approval",
+        )
+    return HTTPException(status_code=409, detail=f"Order {order_id} has already been refunded")
+
+
+def replay_or_conflict(
+    conn: sqlite3.Connection, order_id: int, idempotency_key: str, refund: RefundRequest
+) -> dict:
+    """The order already has a refund. If a racing request with this key created it, this
+    is a retry: return that refund. Otherwise raise the 409."""
+    existing = find_refund_by_key(conn, idempotency_key)
+    if existing is not None:
+        return replay_refund(existing, order_id, refund)
+    raise already_refunded_error(conn, order_id)
+
+
 @app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
 def create_refund(
     order_id: int,
@@ -172,42 +205,50 @@ def create_refund(
     # FastAPI maps idempotency_key to the Idempotency-Key header. It is required: missing gets a 422.
     idempotency_key: Annotated[str, Header(min_length=1, max_length=255)],
     conn: DbConn,
+    now: Now,
 ):
-    """Refund an order and mark it as refunded. Retries with the same key are safe.
+    """Refund an order, if the refund policy allows it. Retries with the same key are safe.
 
-    A retry with the same Idempotency-Key and details returns the original refund
-    and changes nothing. Responds with 404 if the order does not exist, 409 if it
-    was already refunded or the key was used for a different request, and 422 if
-    the request is invalid.
+    Refunds above the approval threshold are saved as pending_approval and the
+    order is not marked refunded until a human approves. A retry with the same
+    Idempotency-Key and details returns the original refund and changes nothing.
+
+    Responds with 404 if the order does not exist, 409 if it already has a refund
+    or the key was used for a different request, and 422 if the request is invalid
+    or the policy does not allow the refund (the message says which rule).
     """
     existing = find_refund_by_key(conn, idempotency_key)
     if existing is not None:
         return replay_refund(existing, order_id, refund)
 
-    order = conn.execute("SELECT id FROM orders WHERE id = ?", (order_id,)).fetchone()
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if order is None:
         raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+    # Checked before the rules, so a refunded order gets "already refunded", not "not delivered".
+    if conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone():
+        return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
-    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        status = evaluate_refund(dict(order), refund, now)
+    except RefundRuleError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+    created_at = now.isoformat(timespec="seconds")
     try:
         with conn:  # one transaction: both writes succeed, or neither does
             cursor = conn.execute(
                 "INSERT INTO refunds (order_id, amount_paise, reason, status,"
-                " idempotency_key, created_at) VALUES (?, ?, ?, 'completed', ?, ?)",
-                (order_id, refund.amount_paise, refund.reason, idempotency_key, created_at),
+                " idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (order_id, refund.amount_paise, refund.reason, status, idempotency_key, created_at),
             )
-            conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
+            if status == "completed":  # a pending refund leaves the order as it is
+                conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
     except sqlite3.IntegrityError as error:
         if "refunds.order_id" not in str(error) and "refunds.idempotency_key" not in str(error):
             raise  # some other constraint failed: a server bug, not a duplicate refund
         # A UNIQUE rule rejected it. Relying on this, not only the checks above, stops two
         # simultaneous requests from both creating a refund. A racing retry breaks both rules
         # and SQLite names just one, so look the key up instead of trusting that name.
-        existing = find_refund_by_key(conn, idempotency_key)
-        if existing is not None:
-            return replay_refund(existing, order_id, refund)
-        raise HTTPException(
-            status_code=409, detail=f"Order {order_id} has already been refunded"
-        ) from None
+        return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
