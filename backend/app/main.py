@@ -14,13 +14,14 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header
 from fastapi.security import APIKeyHeader
 
 from backend.app.db import connect
+from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
 from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
-from backend.app.rules import RefundRuleError, evaluate_refund
+from backend.app.rules import PolicyViolation, evaluate_refund
 
 logger = logging.getLogger(__name__)
 
@@ -39,19 +40,23 @@ def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> 
     if not expected:
         # The log tells the operator how to fix it. The client only learns it is not at fault.
         logger.error("BACKEND_API_KEY is not set: add it to %s or the environment", ENV_FILE)
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "The server's API-key check is not configured, so no request can be"
-                " authorized. This is a server problem, not a problem with your API key."
-            ),
+        raise ApiError(
+            500,
+            "server_misconfigured",
+            "The server's API-key check is not configured, so no request can be"
+            " authorized. This is a server problem, not a problem with your API key.",
         )
     # Compare bytes: compare_digest raises an error on str values with non-ASCII characters.
     if api_key is None or not secrets.compare_digest(api_key.encode(), expected.encode()):
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise ApiError(401, "unauthorized", "Invalid API key")
 
 
-app = FastAPI(title="Support Desk API", dependencies=[Depends(require_api_key)])
+app = FastAPI(
+    title="Support Desk API",
+    dependencies=[Depends(require_api_key)],
+    responses=ERROR_RESPONSES,  # document the standard error body on every endpoint
+)
+register_error_handlers(app)  # every error, including FastAPI's own, uses the same format
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
@@ -84,7 +89,7 @@ def get_order(order_id: int, conn: DbConn):  # the int hint makes /orders/abc re
     """
     order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if order is None:
-        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
     items = conn.execute(
         "SELECT sku, quantity, unit_price_paise FROM order_items WHERE order_id = ?",
         (order_id,),
@@ -105,7 +110,7 @@ def get_customer_orders(customer_id: int, conn: DbConn):
         (customer_id,),
     ).fetchone()
     if customer is None:
-        raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found")
+        raise ApiError(404, "not_found", f"Customer {customer_id} not found")
     # One query, no N+1. LEFT JOIN keeps an order that has no items (its item columns are NULL).
     rows = conn.execute(
         """
@@ -157,7 +162,7 @@ def get_product_stock(sku: str, conn: DbConn):
         (sku,),
     ).fetchone()
     if product is None:
-        raise HTTPException(status_code=404, detail=f"Product {sku} not found")
+        raise ApiError(404, "not_found", f"Product {sku} not found")
     return dict(product)
 
 
@@ -183,23 +188,26 @@ def replay_refund(existing: sqlite3.Row, order_id: int, refund: RefundRequest) -
         and existing["amount_paise"] == refund.amount_paise
     )
     if not is_same_request:
-        raise HTTPException(
-            status_code=409, detail="Idempotency key was already used for a different request"
+        raise ApiError(
+            409,
+            "idempotency_key_reused",
+            "Idempotency key was already used for a different request",
         )
     return dict(existing)
 
 
-def already_refunded_error(conn: sqlite3.Connection, order_id: int) -> HTTPException:
+def already_refunded_error(conn: sqlite3.Connection, order_id: int) -> ApiError:
     """A 409 that says whether the order's existing refund is done or waiting for approval."""
     existing = conn.execute(
         "SELECT status FROM refunds WHERE order_id = ?", (order_id,)
     ).fetchone()
     if existing is not None and existing["status"] == "pending_approval":
-        return HTTPException(
-            status_code=409,
-            detail=f"Order {order_id} already has a refund waiting for human approval",
+        return ApiError(
+            409,
+            "refund_pending_approval",
+            f"Order {order_id} already has a refund waiting for human approval",
         )
-    return HTTPException(status_code=409, detail=f"Order {order_id} has already been refunded")
+    return ApiError(409, "already_refunded", f"Order {order_id} has already been refunded")
 
 
 def replay_or_conflict(
@@ -238,15 +246,15 @@ def create_refund(
 
     order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if order is None:
-        raise HTTPException(status_code=404, detail=f"Order {order_id} not found")
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
     # Checked before the rules, so a refunded order gets "already refunded", not "not delivered".
     if conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone():
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     try:
         status = evaluate_refund(dict(order), refund, now)
-    except RefundRuleError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from None
+    except PolicyViolation as error:
+        raise ApiError(422, "policy_violation", str(error)) from None
 
     created_at = now.isoformat(timespec="seconds")
     try:

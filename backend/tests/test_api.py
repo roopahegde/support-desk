@@ -51,6 +51,11 @@ def client(anonymous_client):
     return anonymous_client
 
 
+def error(code, message):
+    """The standard error body, as every endpoint returns it."""
+    return {"error": {"code": code, "message": message}}
+
+
 def run_sql(db_path, sql):
     """Add data the seed doesn't have, to set up an edge case."""
     conn = connect(db_path)
@@ -87,7 +92,7 @@ def test_get_order_not_yet_shipped_has_null_dates(client):
 def test_get_order_unknown_id_returns_404(client):
     response = client.get("/orders/9999")
     assert response.status_code == 404
-    assert response.json() == {"detail": "Order 9999 not found"}
+    assert response.json() == error("not_found", "Order 9999 not found")
 
 
 def test_get_order_non_integer_id_returns_422(client):
@@ -140,7 +145,7 @@ def test_customer_without_orders_gets_an_empty_list(client, db_path):
 def test_unknown_customer_returns_404(client):
     response = client.get("/customers/999/orders")
     assert response.status_code == 404
-    assert response.json() == {"detail": "Customer 999 not found"}
+    assert response.json() == error("not_found", "Customer 999 not found")
 
 
 def test_customer_non_integer_id_returns_422(client):
@@ -165,7 +170,7 @@ def test_out_of_stock_product_is_not_an_error(client):
 def test_unknown_product_returns_404(client):
     response = client.get("/products/NOPE-1/stock")
     assert response.status_code == 404
-    assert response.json() == {"detail": "Product NOPE-1 not found"}
+    assert response.json() == error("not_found", "Product NOPE-1 not found")
 
 
 # --- GET /policies/refund ---
@@ -222,7 +227,7 @@ def test_second_refund_with_a_new_key_returns_409(client, db_path):
     post_refund(client, key="key-1")
     response = post_refund(client, key="key-2")
     assert response.status_code == 409
-    assert response.json() == {"detail": "Order 1042 has already been refunded"}
+    assert response.json() == error("already_refunded", "Order 1042 has already been refunded")
     assert count_refunds(db_path, 1042) == 1
 
 
@@ -234,7 +239,7 @@ def test_refund_of_seeded_refunded_order_returns_409(client):
 def test_refund_of_unknown_order_returns_404(client):
     response = post_refund(client, order_id=9999)
     assert response.status_code == 404
-    assert response.json() == {"detail": "Order 9999 not found"}
+    assert response.json() == error("not_found", "Order 9999 not found")
 
 
 @pytest.mark.parametrize(
@@ -266,6 +271,9 @@ def test_failed_status_update_rolls_back_the_refund(client, db_path):
         TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY})
     )
     assert response.status_code == 500  # a server failure must not look like "already refunded"
+    assert response.json() == error(
+        "internal_error", "An unexpected server error occurred. Please try again later."
+    )
     assert count_refunds(db_path, 1042) == 0  # the INSERT was undone
 
 
@@ -320,7 +328,7 @@ def test_refund_the_policy_forbids_returns_422_and_changes_nothing(
     status_before = client.get(f"/orders/{order_id}").json()["status"]
     response = post_refund(client, order_id=order_id, body=body)
     assert response.status_code == 422
-    assert response.json() == {"detail": message}
+    assert response.json() == error("policy_violation", message)
     assert count_refunds(db_path, order_id) == 0
     assert client.get(f"/orders/{order_id}").json()["status"] == status_before
 
@@ -344,7 +352,7 @@ def test_second_request_for_a_pending_refund_says_it_awaits_approval(client):
     post_refund(client, order_id=1044, body=body, key="key-1")
     response = post_refund(client, order_id=1044, body=body, key="key-2")
     assert response.status_code == 409
-    assert response.json() == {"detail": "Order 1044 already has a refund waiting for human approval"}
+    assert response.json() == error("refund_pending_approval", "Order 1044 already has a refund waiting for human approval")
 
 
 def test_retry_of_a_pending_refund_returns_it_unchanged(client):
@@ -399,14 +407,14 @@ def test_reusing_a_key_for_a_different_request_returns_409(client, db_path, orde
     post_refund(client)
     response = post_refund(client, order_id=order_id, body=body)
     assert response.status_code == 409
-    assert response.json() == {"detail": "Idempotency key was already used for a different request"}
+    assert response.json() == error("idempotency_key_reused", "Idempotency key was already used for a different request")
     assert count_refunds(db_path, 1046) == 0  # the other order was not refunded
 
 
 def test_missing_idempotency_key_returns_422(client, db_path):
     response = client.post("/orders/1042/refunds", json=VALID_REFUND)
     assert response.status_code == 422
-    assert response.json()["detail"][0]["loc"] == ["header", "idempotency-key"]
+    assert response.json()["error"]["fields"][0]["location"] == "header.idempotency-key"
     assert count_refunds(db_path, 1042) == 0
 
 
@@ -435,7 +443,7 @@ def test_new_key_racing_past_the_key_lookup_returns_409(client, db_path):
     use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP])
     response = post_refund(client, key="key-2")
     assert response.status_code == 409
-    assert response.json() == {"detail": "Order 1042 has already been refunded"}
+    assert response.json() == error("already_refunded", "Order 1042 has already been refunded")
     assert count_refunds(db_path, 1042) == 1
 
 
@@ -459,7 +467,7 @@ def test_new_key_racing_to_the_insert_returns_409(client, db_path):
     use_connection_that_misses_first_lookups(db_path, [KEY_LOOKUP, ORDER_REFUND_CHECK])
     response = post_refund(client, order_id=1044, body=LARGE_REFUND, key="key-2")
     assert response.status_code == 409
-    assert response.json() == {"detail": "Order 1044 already has a refund waiting for human approval"}
+    assert response.json() == error("refund_pending_approval", "Order 1044 already has a refund waiting for human approval")
     assert count_refunds(db_path, 1044) == 1
 
 
@@ -505,13 +513,13 @@ def test_correct_api_key_is_accepted(client):
 def test_missing_api_key_returns_401(anonymous_client):
     response = anonymous_client.get("/orders/1042")
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid API key"}
+    assert response.json() == error("unauthorized", "Invalid API key")
 
 
 def test_wrong_api_key_gets_the_same_401_as_a_missing_one(anonymous_client):
     response = anonymous_client.get("/orders/1042", headers={"X-API-Key": "wrong"})
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid API key"}
+    assert response.json() == error("unauthorized", "Invalid API key")
 
 
 @pytest.mark.parametrize(
@@ -543,7 +551,8 @@ def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
     monkeypatch.delenv("BACKEND_API_KEY")
     response = client.get("/orders/1042")
     assert response.status_code == 500
-    assert "not a problem with your API key" in response.json()["detail"]
+    assert response.json()["error"]["code"] == "server_misconfigured"
+    assert "not a problem with your API key" in response.json()["error"]["message"]
     assert TEST_API_KEY not in response.text
 
 
@@ -579,3 +588,53 @@ def test_docs_stay_public(anonymous_client):
 def test_swagger_advertises_the_api_key_header(anonymous_client):
     schemes = anonymous_client.get("/openapi.json").json()["components"]["securitySchemes"]
     assert schemes["APIKeyHeader"] == {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+
+
+# --- One error format everywhere ---
+
+
+def test_validation_error_lists_each_field_with_a_readable_summary(client):
+    response = post_refund(client, body={"reason": "bored", "amount_paise": 0})
+    assert response.status_code == 422
+    body = response.json()["error"]
+    assert body["code"] == "validation_error"
+    assert [field["location"] for field in body["fields"]] == ["body.reason", "body.amount_paise"]
+    assert body["message"].startswith("The request is invalid: body.reason: Input should be")
+    assert "body.amount_paise: Input should be greater than 0" in body["message"]
+
+
+def test_invalid_path_parameter_uses_the_standard_format(client):
+    body = client.get("/orders/abc").json()["error"]
+    assert body["code"] == "validation_error"
+    assert body["fields"][0]["location"] == "path.order_id"
+
+
+def test_unknown_url_uses_the_standard_format(client):
+    response = client.get("/no-such-endpoint")
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "There is no endpoint at /no-such-endpoint.")
+
+
+def test_wrong_http_method_uses_the_standard_format(client):
+    response = client.delete("/orders/1042")
+    assert response.status_code == 405
+    assert response.json() == error("method_not_allowed", "DELETE is not allowed on /orders/1042.")
+
+
+def test_unexpected_error_hides_internal_details(client, db_path):
+    run_sql(db_path, "DROP TABLE order_items")  # make the endpoint crash
+    response = TestClient(
+        app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY}
+    ).get("/orders/1042")
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "internal_error"
+    assert "order_items" not in response.text  # no table names or stack trace leak out
+
+
+def test_swagger_documents_the_standard_error_body(anonymous_client):
+    spec = anonymous_client.get("/openapi.json").json()
+    assert "HTTPValidationError" not in spec["components"]["schemas"]  # FastAPI's default is gone
+    refund_responses = spec["paths"]["/orders/{order_id}/refunds"]["post"]["responses"]
+    for status in ("401", "422", "500"):
+        schema = refund_responses[status]["content"]["application/json"]["schema"]
+        assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
