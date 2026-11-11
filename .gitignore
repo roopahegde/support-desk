@@ -15,3 +15,12 @@ htmlcov/
 
 # Local SQLite databases (re-created by the seed script)
 *.db
+
+# Log files: they can contain customer and order details, so they never belong in git
+*.log
+*.log.[0-9]*
+logs/
+
+# Test reports written by the CI command when it is run locally
+backend-coverage.xml
+backend-test-results.xml

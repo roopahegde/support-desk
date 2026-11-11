@@ -5,6 +5,7 @@ sentence for the agent to read and relay. Handlers below convert FastAPI's own e
 and unexpected crashes, into the same shape.
 """
 
+import json
 import logging
 from typing import Literal
 
@@ -57,6 +58,13 @@ class ApiError(Exception):
 
 
 def error_response(status_code: int, body: ErrorBody) -> JSONResponse:
+    # Every error passes through here, so each one is logged once, in the same shape.
+    # json.dumps quotes the message, so its spaces can't be mistaken for key=value separators.
+    logger.log(
+        logging.ERROR if status_code >= 500 else logging.WARNING,
+        "request_failed status=%s code=%s message=%s",
+        status_code, body.code, json.dumps(body.message),
+    )
     return JSONResponse(
         status_code=status_code,
         content=ErrorResponse(error=body).model_dump(exclude_none=True),

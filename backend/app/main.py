@@ -8,17 +8,20 @@ import logging
 import os
 import secrets
 import sqlite3
-from collections.abc import Iterator
+import time
+import uuid
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.security import APIKeyHeader
 
 from backend.app.db import connect
 from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
+from backend.app.logging_config import configure_logging, request_id_var
 from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
 from backend.app.policy import REFUND_POLICY
 from backend.app.rules import PolicyViolation, check_cancellable, evaluate_refund
@@ -29,6 +32,7 @@ logger = logging.getLogger(__name__)
 # directory that depends on how the server was started, and misses this file under --reload.
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(ENV_FILE)  # existing environment variables win over the file, as in CI
+configure_logging()  # console or file, chosen by LOG_TARGET in backend/.env
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -57,6 +61,36 @@ app = FastAPI(
     responses=ERROR_RESPONSES,  # document the standard error body on every endpoint
 )
 register_error_handlers(app)  # every error, including FastAPI's own, uses the same format
+
+
+@app.middleware("http")
+async def log_requests(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Give every request an ID and log one line for it: method, path, status, duration.
+
+    The ID is returned in the X-Request-ID header, so a client can quote it in a
+    complaint and it can be matched to the log. Headers and bodies are never logged:
+    they can hold the API key and customer data.
+    """
+    request_id_var.set(uuid.uuid4().hex[:12])  # every log line in this request carries it
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        # A crash: the error handler logs the stack trace and builds the 500 response.
+        logger.error(
+            "request method=%s path=%s status=500 duration_ms=%.1f",
+            request.method, request.url.path, (time.perf_counter() - start) * 1000,
+        )
+        raise
+    logger.info(
+        "request method=%s path=%s status=%s duration_ms=%.1f",
+        request.method, request.url.path, response.status_code,
+        (time.perf_counter() - start) * 1000,
+    )
+    response.headers["X-Request-ID"] = request_id_var.get()
+    return response
 
 
 def get_db() -> Iterator[sqlite3.Connection]:
@@ -198,6 +232,7 @@ def replay_refund(existing: sqlite3.Row, order_id: int, refund: RefundRequest) -
             "idempotency_key_reused",
             "Idempotency key was already used for a different request",
         )
+    logger.info("refund_replayed order_id=%s refund_id=%s", order_id, existing["id"])
     return dict(existing)
 
 
@@ -279,6 +314,10 @@ def create_refund(
         # and SQLite names just one, so look the key up instead of trusting that name.
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
+    logger.info(
+        "refund_created order_id=%s refund_id=%s amount_paise=%s reason=%s status=%s",
+        order_id, cursor.lastrowid, refund.amount_paise, refund.reason, status,
+    )
     return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
 
 
@@ -299,10 +338,12 @@ def cancel_order(order_id: int, conn: DbConn):
     with conn:
         # The WHERE clause re-checks the status inside the write itself, so an order that
         # ships between our read and this update is never cancelled.
-        conn.execute(
+        cursor = conn.execute(
             "UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'placed'",
             (order_id,),
         )
+    if cursor.rowcount == 1:  # only log when this request actually changed the order
+        logger.info("order_cancelled order_id=%s", order_id)
 
     order = load_order(conn, order_id)
     if order["status"] != "cancelled":  # it changed after we read it, e.g. it just shipped
