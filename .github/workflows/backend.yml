@@ -1,0 +1,54 @@
+# Backend CI: lint and test the backend on every change to it.
+name: backend
+
+on:
+  push:
+    paths:  # only run when the backend, or this workflow itself, changes
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend.yml"
+
+permissions:
+  contents: read  # this workflow only reads the code; it never writes to the repo
+
+jobs:
+  test:
+    runs-on: ubuntu-latest  # a fresh Linux machine for every run
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip  # reuse downloaded packages between runs
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+
+      - name: Lint
+        run: ruff check backend
+
+      # No .env and no secrets are needed: the tests set their own API key.
+      - name: Test
+        run: >
+          pytest backend/tests
+          --cov=backend.app --cov-report=term-missing
+          --cov-report=xml:backend-coverage.xml
+          --junitxml=backend-test-results.xml
+
+      - name: Upload test and coverage reports
+        if: always()  # upload even when tests fail: that is when the reports matter most
+        uses: actions/upload-artifact@v7
+        with:
+          name: backend-reports
+          path: |
+            backend-test-results.xml
+            backend-coverage.xml
