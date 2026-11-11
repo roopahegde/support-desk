@@ -60,3 +60,38 @@ def test_database_rejects_a_second_refund_for_the_same_order(conn):
             " idempotency_key, created_at) VALUES (1045, 100, 'damaged', 'completed',"
             " 'another-key', '2026-10-01T00:00:00+00:00')"
         )
+
+
+def add_event(conn, event_type="cancelled"):
+    """Insert one audit event for order 1048 and return its id."""
+    cursor = conn.execute(
+        "INSERT INTO order_events (order_id, event_type, from_status, to_status, actor,"
+        " occurred_at) VALUES (1048, ?, 'placed', 'cancelled', 'staff:test', ?)",
+        (event_type, NOW.isoformat()),
+    )
+    return cursor.lastrowid
+
+
+def test_an_order_event_can_be_recorded(conn):
+    event_id = add_event(conn)
+    event = conn.execute("SELECT * FROM order_events WHERE id = ?", (event_id,)).fetchone()
+    assert event["actor"] == "staff:test"
+    assert event["on_behalf_of"] is None  # optional columns default to NULL
+
+
+def test_database_rejects_an_unknown_event_type(conn):
+    with pytest.raises(sqlite3.IntegrityError):
+        add_event(conn, event_type="deleted")
+
+
+def test_order_events_cannot_be_edited(conn):
+    event_id = add_event(conn)
+    # The trigger's RAISE(ABORT, ...) reaches Python as an IntegrityError carrying our message.
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("UPDATE order_events SET actor = 'someone-else' WHERE id = ?", (event_id,))
+
+
+def test_order_events_cannot_be_deleted(conn):
+    event_id = add_event(conn)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute("DELETE FROM order_events WHERE id = ?", (event_id,))

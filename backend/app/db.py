@@ -60,6 +60,32 @@ CREATE TABLE IF NOT EXISTS refunds (
     idempotency_key TEXT NOT NULL UNIQUE,  -- a retried request can never create a 2nd refund
     created_at      TEXT NOT NULL
 );
+
+-- The audit trail: one row per change to an order, written in the same transaction as the
+-- change itself. Rows are only ever added, never edited or removed (see the triggers below).
+CREATE TABLE IF NOT EXISTS order_events (
+    id           INTEGER PRIMARY KEY,
+    order_id     INTEGER NOT NULL REFERENCES orders(id),
+    event_type   TEXT NOT NULL CHECK (event_type IN ('placed', 'shipped', 'delivered',
+                     'cancelled', 'refund_completed', 'refund_pending_approval')),
+    from_status  TEXT,           -- the order's status before; NULL for 'placed'
+    to_status    TEXT NOT NULL,  -- after; the same as before for a pending refund
+    actor        TEXT NOT NULL,  -- who made the change, from their API key: 'agent:support-desk'
+    on_behalf_of TEXT,           -- the end customer they said they served; NOT verified
+    request_id   TEXT,           -- matches req=... in the log; NULL for seeded history
+    details      TEXT,           -- JSON with event-specific facts, e.g. refund id and amount
+    occurred_at  TEXT NOT NULL
+);
+
+-- Show an order's history without reading the whole table.
+CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id);
+
+-- Append-only, enforced by the database: no code path, bug or SQL console can rewrite history.
+CREATE TRIGGER IF NOT EXISTS order_events_no_update BEFORE UPDATE ON order_events
+BEGIN SELECT RAISE(ABORT, 'order_events is append-only'); END;
+
+CREATE TRIGGER IF NOT EXISTS order_events_no_delete BEFORE DELETE ON order_events
+BEGIN SELECT RAISE(ABORT, 'order_events is append-only'); END;
 """
 
 
