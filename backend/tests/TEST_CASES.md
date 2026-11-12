@@ -255,3 +255,12 @@ the database (`sqlite3 backend/support_desk.db`) and run
 | TC-AUD-09 | Actor follows the key | Cancel order 1048 with the `agent:` key | The event's actor is `agent:support-desk` | `test_actor_comes_from_the_key_that_was_used` |
 | TC-AUD-10[x] | On-behalf-of is optional | Cancel without the header, or with a blank one | The event's `on_behalf_of` is empty (`NULL`) | `test_on_behalf_of_is_optional_and_blank_means_none` |
 | TC-AUD-11 | On-behalf-of is limited in size | Cancel with a 101-character `X-On-Behalf-Of` | `422`, field `header.x-on-behalf-of`; order 1048 still `placed` | `test_oversized_on_behalf_of_is_rejected_and_changes_nothing` |
+
+### Reading the history: `GET /orders/{id}/events`
+
+| ID | Scenario | Steps | Expected result | Automated test |
+|---|---|---|---|---|
+| TC-HIS-01 | Seeded history, oldest first | `GET /orders/1045/events` | `200`; `placed`, `shipped`, `delivered`, `refund_completed` in that order; the first is 18 days ago; the refund's `details` is a JSON object with amount `129900` | `test_order_events_show_the_seeded_history_oldest_first` |
+| TC-HIS-02 | API changes appear in the history | Cancel order 1048 with `X-On-Behalf-Of: customer:1`, then `GET /orders/1048/events` | `placed`, then `cancelled` with your actor, `customer:1` and a request ID | `test_order_events_include_changes_made_through_the_api` |
+| TC-HIS-03 | Unknown order | `GET /orders/9999/events` | `404`, code `not_found`, "Order 9999 not found" | `test_order_events_of_unknown_order_returns_404` |
+| TC-HIS-04 | Reading changes nothing | `GET /orders/1042/events` twice | Both return the same 3 events | `test_reading_order_events_records_nothing` |

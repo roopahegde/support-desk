@@ -528,6 +528,7 @@ def test_wrong_api_key_gets_the_same_401_as_a_missing_one(anonymous_client):
     "path",
     [
         "/orders/1042",
+        "/orders/1042/events",
         "/customers/1/orders",
         "/products/SPK-200/stock",
         "/policies/refund",
@@ -912,3 +913,36 @@ def test_oversized_on_behalf_of_is_rejected_and_changes_nothing(client, db_path)
     assert response.status_code == 422
     assert response.json()["error"]["fields"][0]["location"] == "header.x-on-behalf-of"
     assert order_status(db_path, 1048) == "placed"
+
+
+# --- GET /orders/{id}/events ---
+
+
+def test_order_events_show_the_seeded_history_oldest_first(client):
+    response = client.get("/orders/1045/events")
+    assert response.status_code == 200
+    events = response.json()
+    assert [e["event_type"] for e in events] == ["placed", "shipped", "delivered", "refund_completed"]
+    assert events[0]["occurred_at"] == (NOW - timedelta(days=18)).isoformat().replace("+00:00", "Z")
+    assert events[-1]["details"]["amount_paise"] == 129_900  # a JSON object, not a string
+
+
+def test_order_events_include_changes_made_through_the_api(client):
+    client.post("/orders/1048/cancel", headers={"X-On-Behalf-Of": "customer:1"})
+    events = client.get("/orders/1048/events").json()
+    assert [e["event_type"] for e in events] == ["placed", "cancelled"]
+    cancelled = events[-1]
+    assert cancelled["actor"] == TEST_ACTOR
+    assert cancelled["on_behalf_of"] == "customer:1"
+    assert cancelled["request_id"] is not None and cancelled["details"] is None
+
+
+def test_order_events_of_unknown_order_returns_404(client):
+    response = client.get("/orders/9999/events")
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "Order 9999 not found")
+
+
+def test_reading_order_events_records_nothing(client):
+    client.get("/orders/1042/events")
+    assert len(client.get("/orders/1042/events").json()) == 3  # reads are not changes

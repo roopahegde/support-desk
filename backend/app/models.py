@@ -52,6 +52,21 @@ class RefundRequest(BaseModel):
     amount_paise: int = Field(gt=0)  # gt=0: reject zero and negative refunds
 
 
+class OrderEvent(BaseModel):
+    """One change in an order's history, as the audit trail recorded it."""
+
+    id: int
+    order_id: int
+    event_type: EventType
+    from_status: OrderStatus | None  # None for 'placed': there was no order before
+    to_status: OrderStatus
+    actor: str  # the client whose API key made the change, e.g. "agent:support-desk"
+    on_behalf_of: str | None  # as the caller stated it: NOT verified
+    request_id: str | None  # matches req=... in the backend log; None for seeded history
+    details: dict | None  # event-specific facts, e.g. a refund's id, amount and reason
+    occurred_at: datetime
+
+
 class Refund(BaseModel):
     id: int
     order_id: int

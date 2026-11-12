@@ -4,6 +4,7 @@ Run from the repo root:  python -m uvicorn backend.app.main:app --reload
 Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 """
 
+import json
 import logging
 import os
 import secrets
@@ -23,7 +24,14 @@ from backend.app.audit import record_event
 from backend.app.db import connect
 from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
 from backend.app.logging_config import configure_logging, request_id_var
-from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
+from backend.app.models import (
+    Order,
+    OrderEvent,
+    ProductStock,
+    Refund,
+    RefundPolicy,
+    RefundRequest,
+)
 from backend.app.policy import REFUND_POLICY
 from backend.app.rules import PolicyViolation, check_cancellable, evaluate_refund
 
@@ -193,6 +201,26 @@ def load_order(conn: sqlite3.Connection, order_id: int) -> dict:
         (order_id,),
     ).fetchall()
     return {**dict(order), "items": [dict(item) for item in items]}
+
+
+@app.get("/orders/{order_id}/events", response_model=list[OrderEvent])
+def get_order_events(order_id: int, conn: DbConn):
+    """Return the order's history, oldest first: every change, who made it, and when.
+
+    Responds with 404 if the order does not exist. on_behalf_of is shown exactly as the
+    caller stated it; it is not verified.
+    """
+    if conn.execute("SELECT 1 FROM orders WHERE id = ?", (order_id,)).fetchone() is None:
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
+    rows = conn.execute(
+        "SELECT * FROM order_events WHERE order_id = ? ORDER BY occurred_at, id",  # id breaks ties
+        (order_id,),
+    ).fetchall()
+    # details is stored as JSON text; return it as a real JSON object, not a string inside a string.
+    return [
+        {**dict(row), "details": json.loads(row["details"]) if row["details"] else None}
+        for row in rows
+    ]
 
 
 # response_model: FastAPI validates the return value against list[Order] and documents it in Swagger.

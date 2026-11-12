@@ -136,6 +136,7 @@ Money is always in **paise** (1 INR = 100 paise), so INR 3,499 is `349900`.
 | Method | Path | What it does |
 |---|---|---|
 | GET | `/orders/{id}` | One order with its line items |
+| GET | `/orders/{id}/events` | The order's history, oldest first: each change, who made it (`actor`), on whose behalf (as stated, not verified), when, and the request ID |
 | GET | `/customers/{id}/orders` | A customer's orders, newest first (`[]` if they have none) |
 | GET | `/products/{sku}/stock` | Stock level. `0` is a valid answer, not an error. |
 | GET | `/policies/refund` | The refund policy the API enforces |
@@ -150,6 +151,19 @@ Money is always in **paise** (1 INR = 100 paise), so INR 3,499 is `349900`.
   refunded. (There is no approval endpoint yet.)
 - **One refund per order.** Sending the same `Idempotency-Key` again returns the original
   refund instead of creating a second one, so clients can retry safely after a timeout.
+
+### Order history (audit trail)
+- Every refund and cancellation adds one row to the `order_events` table, in the **same
+  transaction** as the change itself, so there is never a change without its record (or a record
+  without its change). Retries and repeated cancels change nothing, so they add nothing.
+- **Who** is the client whose API key was used. **On behalf of** comes from the optional
+  `X-On-Behalf-Of` header (for example `customer:1`, up to 100 characters). It is recorded as
+  stated and is **not verified**.
+- The table is append-only: database triggers reject any `UPDATE` or `DELETE`. Only the seed
+  script, which resets test data, drops and recreates it.
+- Seeded orders come with their history (placed, shipped, delivered, refunded) from the actor
+  `system:seed`.
+- Refused requests (`409`, `422`) are not history: they appear in the log only.
 
 ### Cancellation rules
 - Only orders that are still **placed** (not shipped) can be cancelled.
@@ -232,9 +246,6 @@ backend/
 
 - An approval workflow for `pending_approval` refunds (listing them, then approving or rejecting them).
 - An endpoint that checks refund eligibility **without** creating a refund (planned with the MCP layer).
-- Reading order history: refunds and cancellations are recorded in the append-only `order_events`
-  table (who, on whose behalf, when, and the request ID), but there is no endpoint to read it yet,
-  and seeded orders have no history (planned next).
 - Ownership checks: any client with a valid key can read or change any customer's orders.
 - Production concerns: a server database such as PostgreSQL with migrations, a secrets manager
   instead of `.env`, HTTPS and rate limiting.
