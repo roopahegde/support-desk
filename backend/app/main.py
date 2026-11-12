@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.security import APIKeyHeader
 
 from backend.app.audit import record_event
@@ -29,7 +29,9 @@ from backend.app.models import (
     OrderEvent,
     ProductStock,
     Refund,
+    RefundEligibility,
     RefundPolicy,
+    RefundReason,
     RefundRequest,
 )
 from backend.app.policy import REFUND_POLICY
@@ -348,6 +350,51 @@ def replay_or_conflict(
     raise already_refunded_error(conn, order_id)
 
 
+def order_has_refund(conn: sqlite3.Connection, order_id: int) -> bool:
+    """True if the order already has a refund, completed or waiting for approval."""
+    return conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone() is not None
+
+
+@app.get("/orders/{order_id}/refund-eligibility", response_model=RefundEligibility)
+def check_refund_eligibility(
+    order_id: int,
+    reason: RefundReason,  # a query parameter: ?reason=damaged (any other value gets a 422)
+    amount_paise: Annotated[int, Query(gt=0)],  # ?amount_paise=349900
+    conn: DbConn,
+    now: Now,
+):
+    """Say whether a refund would be allowed right now, without creating one. Changes nothing.
+
+    Runs the same checks as POST /orders/{id}/refunds, in the same order. A refund the
+    policy forbids is a normal answer (200 with outcome not_eligible), not an error.
+    Responds with 404 if the order does not exist, and 422 if the query is invalid.
+    """
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if order is None:
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
+    question = {"order_id": order_id, "reason": reason, "amount_paise": amount_paise}
+
+    if order_has_refund(conn, order_id):
+        refused = already_refunded_error(conn, order_id)  # the exact 409 the refund would get
+        return {**question, "outcome": "not_eligible", "code": refused.code,
+                "message": refused.message}
+    refund_request = RefundRequest(reason=reason, amount_paise=amount_paise)
+    try:
+        status = evaluate_refund(dict(order), refund_request, now)  # the same rule code as POST
+    except PolicyViolation as error:
+        return {**question, "outcome": "not_eligible", "code": "policy_violation",
+                "message": str(error)}
+
+    subject = f"A refund of {amount_paise} paise for order {order_id} (reason '{reason}')"
+    if status == "pending_approval":
+        limit = REFUND_POLICY.approval_threshold_paise
+        message = (f"{subject} is allowed, but it is above the {limit} paise limit, so a human"
+                   " must approve it before it is paid.")
+        return {**question, "outcome": "needs_approval", "code": None, "message": message}
+    return {**question, "outcome": "eligible", "code": None,
+            "message": f"{subject} is allowed and would be paid immediately if requested now."}
+
+
 @app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
 def create_refund(
     order_id: int,
@@ -377,7 +424,7 @@ def create_refund(
     if order is None:
         raise ApiError(404, "not_found", f"Order {order_id} not found")
     # Checked before the rules, so a refunded order gets "already refunded", not "not delivered".
-    if conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone():
+    if order_has_refund(conn, order_id):
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     try:

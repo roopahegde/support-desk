@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from backend.app.errors import ErrorCode
+
 OrderStatus = Literal["placed", "shipped", "delivered", "cancelled", "refunded"]
 RefundReason = Literal["damaged", "wrong_item", "not_as_described", "changed_mind"]
 RefundStatus = Literal["completed", "pending_approval"]
@@ -65,6 +67,21 @@ class OrderEvent(BaseModel):
     request_id: str | None  # matches req=... in the backend log; None for seeded history
     details: dict | None  # event-specific facts, e.g. a refund's id, amount and reason
     occurred_at: datetime
+
+
+EligibilityOutcome = Literal["eligible", "needs_approval", "not_eligible"]
+
+
+class RefundEligibility(BaseModel):
+    """The answer to "would this refund be allowed right now?". Nothing is created or changed."""
+
+    order_id: int
+    reason: RefundReason
+    amount_paise: int
+    outcome: EligibilityOutcome  # needs_approval: allowed, but a human must approve it first
+    # Only for not_eligible: the code POST /orders/{id}/refunds would return, e.g. policy_violation.
+    code: ErrorCode | None
+    message: str  # a full sentence for the agent to relay
 
 
 class Refund(BaseModel):

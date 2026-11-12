@@ -140,6 +140,7 @@ Money is always in **paise** (1 INR = 100 paise), so INR 3,499 is `349900`.
 | GET | `/customers/{id}/orders` | A customer's orders, newest first (`[]` if they have none) |
 | GET | `/products/{sku}/stock` | Stock level. `0` is a valid answer, not an error. |
 | GET | `/policies/refund` | The refund policy the API enforces |
+| GET | `/orders/{id}/refund-eligibility?reason=damaged&amount_paise=349900` | Would this refund be allowed right now? Answers `eligible`, `needs_approval` or `not_eligible` (with the code and message the refund would get). Creates nothing. "No" is a `200`, not an error. |
 | POST | `/orders/{id}/refunds` | Create a refund. Needs an `Idempotency-Key` header and a body like `{"reason": "damaged", "amount_paise": 349900}` |
 | POST | `/orders/{id}/cancel` | Cancel an order that has not shipped |
 
@@ -245,7 +246,6 @@ backend/
 ## 10. Not included yet
 
 - An approval workflow for `pending_approval` refunds (listing them, then approving or rejecting them).
-- An endpoint that checks refund eligibility **without** creating a refund (planned with the MCP layer).
 - Ownership checks: any client with a valid key can read or change any customer's orders.
 - Production concerns: a server database such as PostgreSQL with migrations, a secrets manager
   instead of `.env`, HTTPS and rate limiting.

@@ -157,6 +157,22 @@ Every request below sends a valid API key and an `Idempotency-Key`, unless the c
 | TC-IDEM-08 | Racing retry (reached the database write) | As TC-IDEM-06, but both requests pass every check before writing | `201`; the original refund is returned; one refund exists. **Automated only** | `test_retry_racing_to_the_insert_returns_the_original_refund` |
 | TC-IDEM-09 | Racing new key (reached the database write) | As TC-IDEM-07, but both requests pass every check before writing | `409`, code `refund_pending_approval`; one refund exists. **Automated only** | `test_new_key_racing_to_the_insert_returns_409` |
 
+### Refund eligibility (dry run): `GET /orders/{id}/refund-eligibility`
+
+Asks "would this refund be allowed right now?" with `?reason=...&amount_paise=...`. It creates
+and changes nothing. "Not eligible" is a normal answer (`200`), not an error.
+
+| ID | Scenario | Steps | Expected result | Automated test |
+|---|---|---|---|---|
+| TC-ELIG-01 | Eligible | `GET /orders/1042/refund-eligibility?reason=damaged&amount_paise=349900` | `200`, outcome `eligible`, code `null`, "...is allowed and would be paid immediately if requested now." | `test_eligible_refund_is_answered_with_eligible` |
+| TC-ELIG-02 | Needs approval | Order 1044, amount `5499900` | `200`, outcome `needs_approval`, "...a human must approve it..." | `test_large_refund_is_answered_with_needs_approval` |
+| TC-ELIG-03 | Refusal is an answer | Order 1043, amount `219900` (45 days ago) | `200` (not `422`), outcome `not_eligible`, code `policy_violation` | `test_refused_refund_is_an_answer_not_an_error` |
+| TC-ELIG-04[x] | Same answer as a real refund | For orders 1042, 1044, 1043, 1047, 1049 (`changed_mind`), 1042 (amount `349901`) and 1045: ask, then really `POST` the refund | Eligible → `201 completed`; needs approval → `201 pending_approval`; not eligible → the `POST` fails with the **same** code and message | `test_eligibility_answer_matches_what_the_refund_endpoint_does` |
+| TC-ELIG-05 | Pending refund | Do TC-REF-11, then ask about order 1044 | Outcome `not_eligible`, code `refund_pending_approval` | `test_pending_refund_makes_the_order_not_eligible` |
+| TC-ELIG-06 | Asking changes nothing | Ask every TC-ELIG-04 question | No refunds, no status changes, no history events | `test_asking_about_eligibility_changes_nothing` |
+| TC-ELIG-07 | Unknown order | Ask about order 9999 | `404`, code `not_found` | `test_eligibility_of_unknown_order_returns_404` |
+| TC-ELIG-08[x] | Invalid question | Reason missing or `bored`; amount missing or `0` | `422`, naming `query.reason` or `query.amount_paise` | `test_invalid_eligibility_question_returns_422` |
+
 ## 5. Cancelling orders — `test_api.py`
 
 | ID | Scenario | Steps | Expected result | Automated test |

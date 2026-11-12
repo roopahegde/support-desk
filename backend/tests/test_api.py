@@ -529,6 +529,7 @@ def test_wrong_api_key_gets_the_same_401_as_a_missing_one(anonymous_client):
     [
         "/orders/1042",
         "/orders/1042/events",
+        "/orders/1042/refund-eligibility?reason=damaged&amount_paise=100",
         "/customers/1/orders",
         "/products/SPK-200/stock",
         "/policies/refund",
@@ -946,3 +947,103 @@ def test_order_events_of_unknown_order_returns_404(client):
 def test_reading_order_events_records_nothing(client):
     client.get("/orders/1042/events")
     assert len(client.get("/orders/1042/events").json()) == 3  # reads are not changes
+
+
+# --- GET /orders/{id}/refund-eligibility ---
+
+
+def ask_eligibility(client, order_id=1042, reason="damaged", amount_paise=349_900):
+    return client.get(
+        f"/orders/{order_id}/refund-eligibility",
+        params={"reason": reason, "amount_paise": amount_paise},
+    )
+
+
+def test_eligible_refund_is_answered_with_eligible(client):
+    response = ask_eligibility(client)
+    assert response.status_code == 200
+    assert response.json() == {
+        "order_id": 1042, "reason": "damaged", "amount_paise": 349_900,
+        "outcome": "eligible", "code": None,
+        "message": "A refund of 349900 paise for order 1042 (reason 'damaged') is allowed"
+        " and would be paid immediately if requested now.",
+    }
+
+
+def test_large_refund_is_answered_with_needs_approval(client):
+    answer = ask_eligibility(client, order_id=1044, amount_paise=5_499_900).json()
+    assert answer["outcome"] == "needs_approval"
+    assert "a human must approve it" in answer["message"]
+
+
+def test_refused_refund_is_an_answer_not_an_error(client):
+    response = ask_eligibility(client, order_id=1043, amount_paise=219_900)
+    assert response.status_code == 200  # "no" is a valid answer to "would this be allowed?"
+    assert response.json()["outcome"] == "not_eligible"
+    assert response.json()["code"] == "policy_violation"
+
+
+# Every rule, with the outcome the real refund endpoint must agree with.
+SCENARIOS = [
+    (1042, "damaged", 349_900),  # eligible
+    (1044, "damaged", 5_499_900),  # needs approval: above INR 10,000
+    (1043, "damaged", 219_900),  # outside the 30-day window
+    (1047, "damaged", 249_900),  # not delivered yet
+    (1049, "changed_mind", 249_900),  # changed_mind after 7 days
+    (1042, "damaged", 349_901),  # more than the order total
+    (1045, "damaged", 129_900),  # already refunded
+]
+
+
+@pytest.mark.parametrize(("order_id", "reason", "amount_paise"), SCENARIOS)
+def test_eligibility_answer_matches_what_the_refund_endpoint_does(
+    client, order_id, reason, amount_paise
+):
+    answer = ask_eligibility(client, order_id, reason, amount_paise).json()
+    body = {"reason": reason, "amount_paise": amount_paise}
+    refund = post_refund(client, order_id=order_id, body=body, key=f"contract-{order_id}")
+
+    if answer["outcome"] == "not_eligible":
+        # Refused for the same reason, in the same words.
+        assert refund.status_code in (409, 422)
+        assert refund.json()["error"] == {"code": answer["code"], "message": answer["message"]}
+    else:
+        expected = "completed" if answer["outcome"] == "eligible" else "pending_approval"
+        assert refund.status_code == 201
+        assert refund.json()["status"] == expected
+
+
+def test_pending_refund_makes_the_order_not_eligible(client):
+    post_refund(client, order_id=1044, body={"reason": "damaged", "amount_paise": 5_499_900})
+    answer = ask_eligibility(client, order_id=1044, amount_paise=5_499_900).json()
+    assert answer["outcome"] == "not_eligible"
+    assert answer["code"] == "refund_pending_approval"
+
+
+def test_asking_about_eligibility_changes_nothing(client, db_path):
+    for order_id, reason, amount_paise in SCENARIOS:
+        ask_eligibility(client, order_id, reason, amount_paise)
+    assert count_refunds(db_path, 1042) == 0 and count_refunds(db_path, 1044) == 0
+    assert order_status(db_path, 1042) == "delivered"
+    assert api_events(db_path, 1042) == [] and api_events(db_path, 1044) == []
+
+
+def test_eligibility_of_unknown_order_returns_404(client):
+    response = ask_eligibility(client, order_id=9999)
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "Order 9999 not found")
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ({"amount_paise": 100}, "query.reason"),  # reason missing
+        ({"reason": "bored", "amount_paise": 100}, "query.reason"),  # not an accepted reason
+        ({"reason": "damaged"}, "query.amount_paise"),  # amount missing
+        ({"reason": "damaged", "amount_paise": 0}, "query.amount_paise"),  # must be above zero
+    ],
+)
+def test_invalid_eligibility_question_returns_422(client, params, field):
+    response = client.get("/orders/1042/refund-eligibility", params=params)
+    assert response.status_code == 422
+    assert [f["location"] for f in response.json()["error"]["fields"]] == [field]
