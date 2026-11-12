@@ -1,12 +1,17 @@
 """Tests for the SQLite schema and the scenario seed data."""
 
+import json
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from itertools import pairwise
+from typing import get_args
 
 import pytest
 
 from backend.app.db import connect, init_db
-from backend.app.seed import seed
+from backend.app.models import EventType
+from backend.app.seed import ORDERS, seed
 
 # A frozen "now": every date in the seed is relative to it, so assertions are exact.
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -95,3 +100,61 @@ def test_order_events_cannot_be_deleted(conn):
     event_id = add_event(conn)
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         conn.execute("DELETE FROM order_events WHERE id = ?", (event_id,))
+
+
+# --- Seeded order history ---
+
+
+def history(conn, order_id):
+    """An order's events in the order they happened."""
+    return conn.execute(
+        "SELECT * FROM order_events WHERE order_id = ? ORDER BY occurred_at, id", (order_id,)
+    ).fetchall()
+
+
+@pytest.mark.parametrize("order_id", [o["id"] for o in ORDERS])
+def test_every_order_history_leads_to_its_current_status(conn, order_id):
+    events = history(conn, order_id)
+    status = conn.execute("SELECT status FROM orders WHERE id = ?", (order_id,)).fetchone()[0]
+    assert events[0]["event_type"] == "placed" and events[0]["from_status"] is None
+    for before, after in pairwise(events):  # each step starts where the last one ended
+        assert after["from_status"] == before["to_status"]
+    assert events[-1]["to_status"] == status
+
+
+def test_seeded_history_is_marked_as_coming_from_the_seed(conn):
+    rows = conn.execute("SELECT DISTINCT actor, request_id FROM order_events").fetchall()
+    assert [tuple(row) for row in rows] == [("system:seed", None)]  # no request caused it
+
+
+def test_seeded_history_uses_the_seed_dates(conn):
+    delivered = history(conn, 1042)[-1]
+    assert delivered["event_type"] == "delivered"
+    assert datetime.fromisoformat(delivered["occurred_at"]) == NOW - timedelta(days=5)
+
+
+def test_refunded_order_history_ends_with_its_refund(conn):
+    last = history(conn, 1045)[-1]
+    refund = conn.execute("SELECT id FROM refunds WHERE order_id = 1045").fetchone()
+    assert last["event_type"] == "refund_completed"
+    assert json.loads(last["details"]) == {
+        "refund_id": refund["id"], "amount_paise": 129_900, "reason": "damaged"
+    }
+
+
+def test_seeding_again_resets_the_history_and_keeps_it_protected(conn):
+    before = conn.execute("SELECT COUNT(*) FROM order_events").fetchone()[0]
+    seed(conn, now=NOW)  # a reset must work even though the table rejects DELETE
+    assert conn.execute("SELECT COUNT(*) FROM order_events").fetchone()[0] == before
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):  # triggers recreated
+        conn.execute("DELETE FROM order_events")
+
+
+def test_event_types_in_the_code_match_the_database(conn):
+    # models.EventType and the CHECK in db.py list the same values. If one changes alone, the
+    # API could accept an event the database rejects, or document one that can never occur.
+    table_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'order_events'"
+    ).fetchone()[0]
+    check_list = re.search(r"event_type IN \(([^)]*)\)", table_sql).group(1)
+    assert set(re.findall(r"'(\w+)'", check_list)) == set(get_args(EventType))

@@ -59,6 +59,12 @@ Customers 1, 2 and 3 exist. Product `SPK-200` has 25 in stock, and `KTL-500` has
 | TC-SEED-08 | Only known event types are accepted | Insert an event with type `deleted` | The database rejects it (integrity error) | `test_database_rejects_an_unknown_event_type` |
 | TC-SEED-09 | Audit history can't be edited | Insert an event, then `UPDATE` it in the database | Rejected with "order_events is append-only" | `test_order_events_cannot_be_edited` |
 | TC-SEED-10 | Audit history can't be erased | Insert an event, then `DELETE` it in the database | Rejected with "order_events is append-only" | `test_order_events_cannot_be_deleted` |
+| TC-SEED-11[x] | Every seeded order has a consistent history | For each seeded order, list its events oldest first | Starts with `placed`; each step starts at the status the previous one ended at; the last step ends at the order's current status | `test_every_order_history_leads_to_its_current_status` |
+| TC-SEED-12 | Seeded history is labelled | Look at the actor and request ID of all seeded events | Actor `system:seed`, request ID empty (no request caused them) | `test_seeded_history_is_marked_as_coming_from_the_seed` |
+| TC-SEED-13 | Seeded history uses the seed's dates | Look at order 1042's last event | `delivered`, exactly 5 days ago | `test_seeded_history_uses_the_seed_dates` |
+| TC-SEED-14 | The seeded refund is in the history | Look at order 1045's last event | `refund_completed`, with the seeded refund's id, amount `129900` and reason `damaged` | `test_refunded_order_history_ends_with_its_refund` |
+| TC-SEED-15 | Re-seeding resets the history | Run `python -m backend.app.seed` twice | The second run succeeds; the event count is the same, not doubled; events still can't be deleted | `test_seeding_again_resets_the_history_and_keeps_it_protected` |
+| TC-SEED-16 | Code and database agree on event types | Compare `EventType` in `models.py` with the `CHECK` list in the database. **Automated only** | The same set of values | `test_event_types_in_the_code_match_the_database` |
 
 ## 2. Business rules — `test_rules.py`
 
