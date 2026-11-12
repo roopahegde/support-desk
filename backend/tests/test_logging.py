@@ -28,7 +28,7 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def client(db_path, monkeypatch):
-    monkeypatch.setenv("BACKEND_API_KEY", TEST_API_KEY)
+    monkeypatch.setenv("BACKEND_API_KEYS", f"staff:test={TEST_API_KEY}")
 
     def get_test_db():
         conn = connect(db_path)

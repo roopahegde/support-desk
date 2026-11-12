@@ -37,22 +37,63 @@ configure_logging()  # console or file, chosen by LOG_TARGET in backend/.env
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> None:
-    """Reject the request unless it carries the correct X-API-Key header."""
-    expected = os.environ.get("BACKEND_API_KEY")
-    # A missing or empty key is a server misconfiguration: fail closed, for every request.
-    if not expected:
-        # The log tells the operator how to fix it. The client only learns it is not at fault.
-        logger.error("BACKEND_API_KEY is not set: add it to %s or the environment", ENV_FILE)
-        raise ApiError(
-            500,
-            "server_misconfigured",
-            "The server's API-key check is not configured, so no request can be"
-            " authorized. This is a server problem, not a problem with your API key.",
-        )
-    # Compare bytes: compare_digest raises an error on str values with non-ASCII characters.
-    if api_key is None or not secrets.compare_digest(api_key.encode(), expected.encode()):
-        raise ApiError(401, "unauthorized", "Invalid API key")
+def parse_api_keys(value: str) -> dict[str, str]:
+    """Turn "actor=key,actor=key" into {key: actor}. Raises ValueError if it is malformed.
+
+    Error messages name the entry's position, never its content: they are logged, and
+    the content contains a key.
+    """
+    keys: dict[str, str] = {}
+    entries = [entry.strip() for entry in value.split(",")]
+    for position, entry in enumerate(entries, start=1):
+        if not entry:
+            continue  # tolerate a trailing comma or blank entry
+        actor, separator, key = entry.partition("=")  # split at the FIRST "=" only
+        if not separator or not actor.strip() or not key.strip():
+            raise ValueError(f"entry {position} is not in the form actor=key")
+        if key.strip() in keys:
+            raise ValueError(f"entry {position} reuses a key that another client already has")
+        keys[key.strip()] = actor.strip()
+    return keys
+
+
+def server_misconfigured() -> ApiError:
+    """The 500 a client gets when the server's own key setup is broken."""
+    # The client only learns it is not at fault. The log, written by the caller, says why.
+    return ApiError(
+        500,
+        "server_misconfigured",
+        "The server's API-key check is not configured, so no request can be"
+        " authorized. This is a server problem, not a problem with your API key.",
+    )
+
+
+def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> str:
+    """Return the client ("actor") whose key is in the X-API-Key header, or reject the request."""
+    try:
+        keys = parse_api_keys(os.environ.get("BACKEND_API_KEYS", ""))
+    except ValueError as problem:
+        logger.error("BACKEND_API_KEYS is invalid (%s): fix it in %s", problem, ENV_FILE)
+        raise server_misconfigured() from None
+    # No keys at all is a server misconfiguration: fail closed, for every request.
+    if not keys:
+        logger.error("BACKEND_API_KEYS is not set: add it to %s or the environment", ENV_FILE)
+        raise server_misconfigured()
+    if api_key is not None:
+        # Check every key, without stopping at a match, so response time doesn't hint at which
+        # client's key was close. Compare bytes: compare_digest rejects non-ASCII str values.
+        matches = [
+            actor for key, actor in keys.items()
+            if secrets.compare_digest(api_key.encode(), key.encode())
+        ]
+        if matches:
+            return matches[0]  # parse_api_keys guarantees there is at most one
+    raise ApiError(401, "unauthorized", "Invalid API key")
+
+
+# An endpoint parameter of this type receives the caller's actor name, e.g. "agent:support-desk".
+# The app-wide dependency below already ran require_api_key; FastAPI reuses that result.
+Actor = Annotated[str, Depends(require_api_key)]
 
 
 app = FastAPI(

@@ -7,11 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.db import connect, init_db
-from backend.app.main import app, get_db, get_now
+from backend.app.main import app, get_db, get_now, parse_api_keys, require_api_key
 from backend.app.seed import seed
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 TEST_API_KEY = "test-key"  # not a real secret: it only exists while a test runs
+TEST_ACTOR = "staff:test"  # the client that TEST_API_KEY belongs to
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def db_path(tmp_path):
 def anonymous_client(db_path, monkeypatch):
     """A client that sends no API key, using the temporary database, never support_desk.db."""
     # monkeypatch undoes this after the test, and the tests never depend on a .env file.
-    monkeypatch.setenv("BACKEND_API_KEY", TEST_API_KEY)
+    monkeypatch.setenv("BACKEND_API_KEYS", f"{TEST_ACTOR}={TEST_API_KEY}")
 
     def get_test_db():
         conn = connect(db_path)
@@ -548,7 +549,7 @@ def test_invalid_id_without_a_key_gets_401_not_validation_details(anonymous_clie
 
 
 def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
-    monkeypatch.delenv("BACKEND_API_KEY")
+    monkeypatch.delenv("BACKEND_API_KEYS")
     response = client.get("/orders/1042")
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "server_misconfigured"
@@ -557,9 +558,9 @@ def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
 
 
 def test_missing_server_key_is_logged_for_the_operator(client, monkeypatch, caplog):
-    monkeypatch.delenv("BACKEND_API_KEY")
+    monkeypatch.delenv("BACKEND_API_KEYS")
     client.get("/orders/1042")
-    assert "BACKEND_API_KEY is not set" in caplog.text  # caplog: pytest's capture of log output
+    assert "BACKEND_API_KEYS is not set" in caplog.text  # caplog: pytest's capture of log output
 
 
 def test_env_file_is_found_from_the_code_not_the_current_directory():
@@ -569,7 +570,7 @@ def test_env_file_is_found_from_the_code_not_the_current_directory():
 
 
 def test_server_with_an_empty_key_is_misconfigured(anonymous_client, monkeypatch):
-    monkeypatch.setenv("BACKEND_API_KEY", "")
+    monkeypatch.setenv("BACKEND_API_KEYS", "")
     assert anonymous_client.get("/orders/1042").status_code == 500
     assert anonymous_client.get("/orders/1042", headers={"X-API-Key": ""}).status_code == 500
 
@@ -588,6 +589,56 @@ def test_docs_stay_public(anonymous_client):
 def test_swagger_advertises_the_api_key_header(anonymous_client):
     schemes = anonymous_client.get("/openapi.json").json()["components"]["securitySchemes"]
     assert schemes["APIKeyHeader"] == {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+
+
+# --- One key per client: who is calling ---
+
+
+def test_api_keys_setting_maps_each_key_to_its_client():
+    keys = parse_api_keys("agent:support-desk=key-a, staff:roopa=key-b,")  # spaces, trailing comma
+    assert keys == {"key-a": "agent:support-desk", "key-b": "staff:roopa"}
+
+
+def test_a_key_may_contain_an_equals_sign():
+    assert parse_api_keys("staff:roopa=abc=def") == {"abc=def": "staff:roopa"}
+
+
+@pytest.mark.parametrize("setting", ["no-separator", "=key-without-actor", "actor-without-key="])
+def test_malformed_api_keys_setting_is_rejected(setting):
+    with pytest.raises(ValueError, match="entry 1 is not in the form actor=key"):
+        parse_api_keys(setting)
+
+
+def test_one_key_for_two_clients_is_rejected_without_revealing_it():
+    with pytest.raises(ValueError, match="entry 2 reuses a key") as problem:
+        parse_api_keys("staff:a=shared-secret,staff:b=shared-secret")
+    assert "shared-secret" not in str(problem.value)  # this message goes into the log
+
+
+def test_each_client_is_recognised_by_its_own_key(monkeypatch):
+    # A dependency is a plain function, so it can be called directly, without HTTP.
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    assert require_api_key("key-a") == "agent:support-desk"
+    assert require_api_key("key-b") == "staff:roopa"
+
+
+def test_every_configured_client_can_call_the_api(anonymous_client, monkeypatch):
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    for key in ("key-a", "key-b"):
+        assert anonymous_client.get("/orders/1042", headers={"X-API-Key": key}).status_code == 200
+    assert anonymous_client.get("/orders/1042", headers={"X-API-Key": "key-c"}).status_code == 401
+
+
+def test_malformed_server_setting_fails_closed_and_tells_the_operator(
+    anonymous_client, monkeypatch, caplog
+):
+    monkeypatch.setenv("BACKEND_API_KEYS", f"{TEST_ACTOR}={TEST_API_KEY},oops")
+    response = anonymous_client.get("/orders/1042", headers={"X-API-Key": TEST_API_KEY})
+    # Even the correct key is refused: a half-readable setting is not trusted at all.
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "server_misconfigured"
+    assert "BACKEND_API_KEYS is invalid (entry 2 is not in the form actor=key)" in caplog.text
+    assert TEST_API_KEY not in caplog.text
 
 
 # --- One error format everywhere ---

@@ -57,10 +57,13 @@ copy backend\.env.example backend\.env
 # macOS / Linux
 cp backend/.env.example backend/.env
 ```
-Then open `backend/.env` and set `BACKEND_API_KEY` to a long random value. You can generate one with:
+Then open `backend/.env` and set `BACKEND_API_KEYS`: one `actor=key` pair per client,
+separated by commas. Give every client its own long random key. Generate each one with:
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
+For example: `BACKEND_API_KEYS=agent:support-desk=<key 1>,staff:yourname=<key 2>`. Use your
+`staff:` key for curl and Swagger. The MCP servers use the `agent:` key.
 `backend/.env` is ignored by git. **Never commit it, and never paste the key into code or chat.**
 
 ### Create the database
@@ -98,7 +101,7 @@ environment variables take priority over the file, which is how CI and productio
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
-| `BACKEND_API_KEY` | **yes** | – | The key clients must send in the `X-API-Key` header. If it is missing, every request fails with `500 server_misconfigured`. |
+| `BACKEND_API_KEYS` | **yes** | – | One `actor=key` pair per client, comma-separated. A client sends its key in the `X-API-Key` header, and the API knows it by its actor name (for example `agent:support-desk`), which the audit trail records. If the setting is missing, empty or malformed, every request fails with `500 server_misconfigured`, and the log says what is wrong without printing a key. |
 | `LOG_TARGET` | no | `console` | `console` or `file` |
 | `LOG_FILE` | no | `logs/backend.log` | Used when `LOG_TARGET=file`. A relative path is relative to `backend/`. The file rotates at 5 MB and keeps 5 old files. |
 | `LOG_LEVEL` | no | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
@@ -147,6 +150,14 @@ Money is always in **paise** (1 INR = 100 paise), so INR 3,499 is `349900`.
   refunded. (There is no approval endpoint yet.)
 - **One refund per order.** Sending the same `Idempotency-Key` again returns the original
   refund instead of creating a second one, so clients can retry safely after a timeout.
+
+### Cancellation rules
+- Only orders that are still **placed** (not shipped) can be cancelled.
+- Cancelling an order that is already cancelled changes nothing and returns it, so retries are safe.
+- Shipped, delivered and refunded orders are refused with `422 policy_violation`, and the
+  message says what the customer can do instead (for example, request a refund after delivery).
+- There is no time limit, value limit or reason. Cancelling only changes the order's status: payments
+  are not modelled. These rules are not published by an endpoint (only the refund policy is).
 
 ### Errors
 Every error, including validation errors and crashes, has the same shape:
@@ -209,8 +220,8 @@ backend/
 
 | Symptom | Cause and fix |
 |---|---|
-| Every request returns `500 server_misconfigured` | `BACKEND_API_KEY` is missing or empty. Set it in `backend/.env`, then restart the server. |
-| `401 unauthorized` | The `X-API-Key` header is missing or wrong. In Swagger, click **Authorize**. |
+| Every request returns `500 server_misconfigured` | `BACKEND_API_KEYS` is missing, empty or malformed. The server log names the bad entry. Fix it in `backend/.env`, then restart the server. If you used the old single `BACKEND_API_KEY` setting, rename it and add an actor: `BACKEND_API_KEYS=staff:yourname=<your key>`. |
+| `401 unauthorized` | The `X-API-Key` header is missing, or isn't one of the keys in `BACKEND_API_KEYS`. In Swagger, click **Authorize**. |
 | A refund on order 1042 says it was delivered over 30 days ago | The seed data is old. Re-run `python -m backend.app.seed`. |
 | `[Errno 10048]` or "address already in use" | Another server is already on port 8000. Stop it, or use `--port 8001`. |
 | `ModuleNotFoundError: No module named 'backend'` | You ran the command from inside `backend/`. Run it from the repository root. |
@@ -221,5 +232,8 @@ backend/
 
 - An approval workflow for `pending_approval` refunds (listing them, then approving or rejecting them).
 - An endpoint that checks refund eligibility **without** creating a refund (planned with the MCP layer).
-- Production concerns: a server database such as PostgreSQL with migrations, a separate API
-  key per client, HTTPS and rate limiting.
+- Order history: the append-only `order_events` table exists, but endpoints don't write to it yet,
+  and there is no endpoint to read it (planned next).
+- Ownership checks: any client with a valid key can read or change any customer's orders.
+- Production concerns: a server database such as PostgreSQL with migrations, a secrets manager
+  instead of `.env`, HTTPS and rate limiting.

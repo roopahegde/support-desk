@@ -18,8 +18,8 @@ the pytest function that checks it, in the file named in that section's heading.
 1. Follow the setup in [../README.md](../README.md) and start the server.
 2. **Reset the data before each session:** `python -m backend.app.seed`. Dates are calculated
    relative to when you seed, so stale data gives wrong refund-window results.
-3. In Swagger UI (http://127.0.0.1:8000/docs), click **Authorize** and enter the API key,
-   unless a case says to send no key.
+3. In Swagger UI (http://127.0.0.1:8000/docs), click **Authorize** and enter your own key from
+   `BACKEND_API_KEYS` (for example the `staff:<yourname>` one), unless a case says to send no key.
 4. Refund requests need an `Idempotency-Key` header. Use a new value per case (for example
    `tc-ref-01`) unless the case says to reuse one.
 5. Cases that change data (refunds, cancellations) affect later cases. Re-seed between them
@@ -45,7 +45,7 @@ Customers 1, 2 and 3 exist. Product `SPK-200` has 25 in stock, and `KTL-500` has
 
 ---
 
-## 1. Seed data — `test_seed.py`
+## 1. Seed data and database rules — `test_seed.py`
 
 | ID | Scenario | Steps | Expected result | Automated test |
 |---|---|---|---|---|
@@ -55,6 +55,10 @@ Customers 1, 2 and 3 exist. Product `SPK-200` has 25 in stock, and `KTL-500` has
 | TC-SEED-04 | An already-refunded order exists | Look up order 1045 and its refund | Status `refunded`; its refund has idempotency key `seed-refund-1045` | `test_order_1045_is_already_refunded` |
 | TC-SEED-05 | An out-of-stock product exists | Look up product `KTL-500` | Stock is `0` | `test_kettle_is_out_of_stock` |
 | TC-SEED-06 | The database itself allows one refund per order | Insert a second refund for order 1045 directly in the database | The database rejects it (integrity error) | `test_database_rejects_a_second_refund_for_the_same_order` |
+| TC-SEED-07 | An audit event can be recorded | Insert an `order_events` row for order 1048 with actor `staff:test` | Saved; `on_behalf_of` is `NULL` when not given | `test_an_order_event_can_be_recorded` |
+| TC-SEED-08 | Only known event types are accepted | Insert an event with type `deleted` | The database rejects it (integrity error) | `test_database_rejects_an_unknown_event_type` |
+| TC-SEED-09 | Audit history can't be edited | Insert an event, then `UPDATE` it in the database | Rejected with "order_events is append-only" | `test_order_events_cannot_be_edited` |
+| TC-SEED-10 | Audit history can't be erased | Insert an event, then `DELETE` it in the database | Rejected with "order_events is append-only" | `test_order_events_cannot_be_deleted` |
 
 ## 2. Business rules — `test_rules.py`
 
@@ -169,13 +173,28 @@ Every request below sends a valid API key and an `Idempotency-Key`, unless the c
 | TC-SEC-04[x] | Every read endpoint is protected | Call each `GET` endpoint without a key | `401` each time | `test_every_read_endpoint_requires_a_key` |
 | TC-SEC-05 | Refund without a key | A valid refund request without a key | `401`; order 1042 is still `delivered` | `test_refund_without_a_key_is_rejected_and_changes_nothing` |
 | TC-SEC-06 | No details leak without a key | `GET /orders/abc` without a key | `401` (not a `422` with validation details) | `test_invalid_id_without_a_key_gets_401_not_validation_details` |
-| TC-SEC-07 | Server has no key configured | Start the server without `BACKEND_API_KEY`, then call any endpoint | `500`, code `server_misconfigured`, saying it is not the caller's fault; no key appears in the response | `test_server_with_no_key_configured_rejects_requests` |
-| TC-SEC-08 | Operator is told how to fix it | As TC-SEC-07, then read the server log | The log says "BACKEND_API_KEY is not set" | `test_missing_server_key_is_logged_for_the_operator` |
-| TC-SEC-09 | Server key set but empty | Set `BACKEND_API_KEY=` (empty), then call with no key and with an empty key | `500` both times (an empty key is never accepted) | `test_server_with_an_empty_key_is_misconfigured` |
+| TC-SEC-07 | Server has no key configured | Start the server without `BACKEND_API_KEYS`, then call any endpoint | `500`, code `server_misconfigured`, saying it is not the caller's fault; no key appears in the response | `test_server_with_no_key_configured_rejects_requests` |
+| TC-SEC-08 | Operator is told how to fix it | As TC-SEC-07, then read the server log | The log says "BACKEND_API_KEYS is not set" | `test_missing_server_key_is_logged_for_the_operator` |
+| TC-SEC-09 | Server key set but empty | Set `BACKEND_API_KEYS=` (empty), then call with no key and with an empty key | `500` both times (an empty key is never accepted) | `test_server_with_an_empty_key_is_misconfigured` |
 | TC-SEC-10 | Key with non-English characters | Send `X-API-Key: é` | `401` (not a server error). **Automated only** | `test_non_ascii_api_key_gets_401_not_a_server_error` |
 | TC-SEC-11 | `.env` is found wherever the server starts | Check where the server looks for its `.env` | Always `backend/.env`, whatever the current folder is | `test_env_file_is_found_from_the_code_not_the_current_directory` |
 | TC-SEC-12 | Docs stay public | Open `/docs` and `/openapi.json` without a key | `200` | `test_docs_stay_public` |
 | TC-SEC-13 | Swagger offers the key field | Open `/openapi.json` | It declares an API key in the `X-API-Key` header (the **Authorize** button) | `test_swagger_advertises_the_api_key_header` |
+
+### One key per client (who is calling)
+
+`BACKEND_API_KEYS` holds one `actor=key` pair per client, for example
+`agent:support-desk=<key>,staff:roopa=<key>`. The actor is recorded as "who" in the audit trail.
+
+| ID | Scenario | Steps | Expected result | Automated test |
+|---|---|---|---|---|
+| TC-SEC-14 | Setting is read correctly | Parse `agent:support-desk=key-a, staff:roopa=key-b,` (with a space and a trailing comma) | Each key maps to its client. **Automated only** | `test_api_keys_setting_maps_each_key_to_its_client` |
+| TC-SEC-15 | A key may contain `=` | Parse `staff:roopa=abc=def` | The key is `abc=def` (only the first `=` separates). **Automated only** | `test_a_key_may_contain_an_equals_sign` |
+| TC-SEC-16[x] | Malformed entry | Parse `no-separator`, `=key-without-actor` or `actor-without-key=` | Rejected: "entry 1 is not in the form actor=key". **Automated only** | `test_malformed_api_keys_setting_is_rejected` |
+| TC-SEC-17 | Two clients share a key | Parse a setting that gives the same key to two clients | Rejected: "entry 2 reuses a key..."; the message does **not** contain the key. **Automated only** | `test_one_key_for_two_clients_is_rejected_without_revealing_it` |
+| TC-SEC-18 | Each client is recognised | Configure two clients, then check each key | Each key identifies its own client. **Automated only** | `test_each_client_is_recognised_by_its_own_key` |
+| TC-SEC-19 | Every configured client can call | Configure two clients; `GET /orders/1042` with each key, then with an unknown key | `200`, `200`, then `401` | `test_every_configured_client_can_call_the_api` |
+| TC-SEC-20 | Malformed setting fails closed | Add a bad entry (e.g. `,oops`) to `BACKEND_API_KEYS`, restart, call with a **correct** key | `500`, code `server_misconfigured`; the log says which entry is wrong, without printing any key | `test_malformed_server_setting_fails_closed_and_tells_the_operator` |
 
 ## 7. Error format — `test_api.py`
 
