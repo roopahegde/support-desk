@@ -1,5 +1,6 @@
 """API tests: real HTTP-style requests through TestClient, against a temporary database."""
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -792,3 +793,122 @@ def test_order_that_ships_mid_request_is_not_cancelled(client, db_path):
     status = conn.execute("SELECT status FROM orders WHERE id = 1048").fetchone()[0]
     conn.close()
     assert status == "shipped"  # the shipment won; the order was not cancelled
+
+
+# --- Audit trail: every change writes one order_events row, in the same transaction ---
+
+
+def api_events(db_path, order_id):
+    """The order's audit events written by API requests (not the history the seed adds)."""
+    conn = connect(db_path)
+    rows = conn.execute(
+        "SELECT * FROM order_events WHERE order_id = ? AND actor != 'system:seed' ORDER BY id",
+        (order_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def order_status(db_path, order_id):
+    conn = connect(db_path)
+    status = conn.execute("SELECT status FROM orders WHERE id = ?", (order_id,)).fetchone()[0]
+    conn.close()
+    return status
+
+
+def block_event_writes(db_path):
+    """Make every INSERT into order_events fail, to prove the change it records is undone too."""
+    run_sql(
+        db_path,
+        "CREATE TRIGGER block_events BEFORE INSERT ON order_events"
+        " BEGIN SELECT RAISE(ABORT, 'simulated failure'); END",
+    )
+
+
+def crash_visible_client():
+    """A client that sees the 500 a real caller would get, instead of the Python error."""
+    return TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY})
+
+
+def test_refund_records_one_event_saying_who_did_what(client, db_path):
+    response = client.post(
+        "/orders/1042/refunds",
+        json=VALID_REFUND,
+        headers={"Idempotency-Key": "key-1", "X-On-Behalf-Of": "customer:1"},
+    )
+    [event] = api_events(db_path, 1042)  # unpacking fails unless there is exactly one
+    assert event["event_type"] == "refund_completed"
+    assert (event["from_status"], event["to_status"]) == ("delivered", "refunded")
+    assert event["actor"] == TEST_ACTOR  # from the API key
+    assert event["on_behalf_of"] == "customer:1"  # from the header, stored as given
+    assert event["request_id"] == response.headers["X-Request-ID"]  # joins to the log
+    assert event["occurred_at"] == NOW.isoformat(timespec="seconds")
+    assert json.loads(event["details"]) == {
+        "refund_id": response.json()["id"], "amount_paise": 349_900, "reason": "damaged"
+    }
+
+
+def test_pending_refund_event_shows_the_order_did_not_change(client, db_path):
+    post_refund(client, order_id=1044, body={"reason": "damaged", "amount_paise": 5_499_900})
+    [event] = api_events(db_path, 1044)
+    assert event["event_type"] == "refund_pending_approval"
+    assert (event["from_status"], event["to_status"]) == ("delivered", "delivered")
+
+
+def test_retried_refund_adds_no_second_event(client, db_path):
+    post_refund(client, key="key-1")
+    post_refund(client, key="key-1")  # a replay: returns the original, changes nothing
+    assert len(api_events(db_path, 1042)) == 1
+
+
+@pytest.mark.parametrize("order_id", [1043, 1045])  # 422 outside the window; 409 already refunded
+def test_refused_refund_records_no_event(client, db_path, order_id):
+    assert post_refund(client, order_id=order_id).status_code in (409, 422)
+    assert api_events(db_path, order_id) == []  # refusals belong in the log, not the history
+
+
+def test_cancel_records_one_event_and_a_repeat_adds_none(client, db_path):
+    client.post("/orders/1048/cancel")
+    client.post("/orders/1048/cancel")  # already cancelled: a no-op
+    [event] = api_events(db_path, 1048)
+    assert event["event_type"] == "cancelled"
+    assert (event["from_status"], event["to_status"]) == ("placed", "cancelled")
+    assert event["actor"] == TEST_ACTOR
+    assert event["occurred_at"] == NOW.isoformat(timespec="seconds")  # cancel uses the clock too
+
+
+def test_refused_cancel_records_no_event(client, db_path):
+    assert client.post("/orders/1047/cancel").status_code == 422  # already shipped
+    assert api_events(db_path, 1047) == []
+
+
+def test_failed_event_write_undoes_the_refund(client, db_path):
+    block_event_writes(db_path)
+    assert post_refund(crash_visible_client()).status_code == 500
+    assert count_refunds(db_path, 1042) == 0  # no refund without its audit record...
+    assert order_status(db_path, 1042) == "delivered"  # ...and no status change either
+
+
+def test_failed_event_write_undoes_the_cancel(client, db_path):
+    block_event_writes(db_path)
+    assert crash_visible_client().post("/orders/1048/cancel").status_code == 500
+    assert order_status(db_path, 1048) == "placed"
+
+
+def test_actor_comes_from_the_key_that_was_used(anonymous_client, db_path, monkeypatch):
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    anonymous_client.post("/orders/1048/cancel", headers={"X-API-Key": "key-a"})
+    assert api_events(db_path, 1048)[0]["actor"] == "agent:support-desk"
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-On-Behalf-Of": "   "}])
+def test_on_behalf_of_is_optional_and_blank_means_none(client, db_path, headers):
+    client.post("/orders/1048/cancel", headers=headers)
+    assert api_events(db_path, 1048)[0]["on_behalf_of"] is None
+
+
+def test_oversized_on_behalf_of_is_rejected_and_changes_nothing(client, db_path):
+    response = client.post("/orders/1048/cancel", headers={"X-On-Behalf-Of": "c" * 101})
+    assert response.status_code == 422
+    assert response.json()["error"]["fields"][0]["location"] == "header.x-on-behalf-of"
+    assert order_status(db_path, 1048) == "placed"

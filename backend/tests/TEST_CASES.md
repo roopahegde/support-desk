@@ -227,3 +227,25 @@ For manual checks, set `LOG_TARGET=file` in `backend/.env`, restart the server, 
 | TC-LOG-11 | Cancellation logged once | Cancel order 1048 twice | Exactly one `order_cancelled` line | `test_cancel_is_logged_only_when_it_changes_the_order` |
 | TC-LOG-12 | Crashes are logged in full | Make an endpoint crash | A `status=500` request line and the full stack trace are in the log (but not in the response). **Automated only** | `test_crash_is_logged_as_an_error_with_its_stack_trace` |
 | TC-LOG-13 | API keys are never logged | Call with the correct key, then with a wrong one | Neither key appears anywhere in the log; the `401` failure is still recorded | `test_api_keys_are_never_logged` |
+
+## 9. Audit trail (order history) — `test_api.py`
+
+Every change to an order adds one row to the `order_events` table, in the same database
+transaction as the change. **Actor** is the client whose API key was used. **On behalf of** is
+copied from the optional `X-On-Behalf-Of` header and is **not verified**. For manual checks, open
+the database (`sqlite3 backend/support_desk.db`) and run
+`SELECT * FROM order_events WHERE order_id = <id>;`.
+
+| ID | Scenario | Steps | Expected result | Automated test |
+|---|---|---|---|---|
+| TC-AUD-01 | A refund is recorded | Do TC-REF-01 with `X-On-Behalf-Of: customer:1` | One event: `refund_completed`, `delivered` → `refunded`, your actor, `customer:1`, the response's `X-Request-ID`, and the refund's id, amount and reason in `details` | `test_refund_records_one_event_saying_who_did_what` |
+| TC-AUD-02 | A pending refund is recorded | Do TC-REF-11 | One event: `refund_pending_approval`, `delivered` → `delivered` (the order did not change) | `test_pending_refund_event_shows_the_order_did_not_change` |
+| TC-AUD-03 | A retry is not recorded twice | Do TC-IDEM-01 | Still exactly one event for order 1042 | `test_retried_refund_adds_no_second_event` |
+| TC-AUD-04[x] | Refused refunds are not recorded | Refund order 1043 (`422`) or 1045 (`409`) | No event (refusals are in the log only) | `test_refused_refund_records_no_event` |
+| TC-AUD-05 | A cancellation is recorded once | Do TC-CAN-01, then TC-CAN-02 | One event: `cancelled`, `placed` → `cancelled`, your actor, the server's time | `test_cancel_records_one_event_and_a_repeat_adds_none` |
+| TC-AUD-06 | A refused cancellation is not recorded | `POST /orders/1047/cancel` (shipped) | `422`; no event | `test_refused_cancel_records_no_event` |
+| TC-AUD-07 | No refund without its record | Make the event write fail during a refund | `500`; no refund saved; order 1042 still `delivered`. **Automated only** | `test_failed_event_write_undoes_the_refund` |
+| TC-AUD-08 | No cancellation without its record | Make the event write fail during a cancel | `500`; order 1048 still `placed`. **Automated only** | `test_failed_event_write_undoes_the_cancel` |
+| TC-AUD-09 | Actor follows the key | Cancel order 1048 with the `agent:` key | The event's actor is `agent:support-desk` | `test_actor_comes_from_the_key_that_was_used` |
+| TC-AUD-10[x] | On-behalf-of is optional | Cancel without the header, or with a blank one | The event's `on_behalf_of` is empty (`NULL`) | `test_on_behalf_of_is_optional_and_blank_means_none` |
+| TC-AUD-11 | On-behalf-of is limited in size | Cancel with a 101-character `X-On-Behalf-Of` | `422`, field `header.x-on-behalf-of`; order 1048 still `placed` | `test_oversized_on_behalf_of_is_rejected_and_changes_nothing` |

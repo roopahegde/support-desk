@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.security import APIKeyHeader
 
+from backend.app.audit import record_event
 from backend.app.db import connect
 from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
 from backend.app.logging_config import configure_logging, request_id_var
@@ -94,6 +95,23 @@ def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> 
 # An endpoint parameter of this type receives the caller's actor name, e.g. "agent:support-desk".
 # The app-wide dependency below already ran require_api_key; FastAPI reuses that result.
 Actor = Annotated[str, Depends(require_api_key)]
+
+
+def get_on_behalf_of(
+    # FastAPI maps x_on_behalf_of to the X-On-Behalf-Of header. Optional: None when not sent.
+    x_on_behalf_of: Annotated[str | None, Header(max_length=100)] = None,
+) -> str | None:
+    """The end customer the caller says it is serving, e.g. "customer:1".
+
+    It is recorded in the audit trail but NOT verified: any caller can send any value.
+    Never use it to decide what a caller is allowed to do.
+    """
+    if x_on_behalf_of is None or not x_on_behalf_of.strip():
+        return None  # an empty header means the same as no header
+    return x_on_behalf_of.strip()
+
+
+OnBehalfOf = Annotated[str | None, Depends(get_on_behalf_of)]
 
 
 app = FastAPI(
@@ -310,6 +328,8 @@ def create_refund(
     idempotency_key: Annotated[str, Header(min_length=1, max_length=255)],
     conn: DbConn,
     now: Now,
+    actor: Actor,
+    on_behalf_of: OnBehalfOf,
 ):
     """Refund an order, if the refund policy allows it. Retries with the same key are safe.
 
@@ -345,8 +365,26 @@ def create_refund(
                 " idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (order_id, refund.amount_paise, refund.reason, status, idempotency_key, created_at),
             )
+            refund_id = cursor.lastrowid
             if status == "completed":  # a pending refund leaves the order as it is
                 conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
+            # Same transaction: if this insert fails, the refund and status change are undone too.
+            # Replays never get here, so a retried request adds no second event.
+            record_event(
+                conn,
+                order_id=order_id,
+                event_type="refund_completed" if status == "completed" else "refund_pending_approval",
+                from_status=order["status"],
+                to_status="refunded" if status == "completed" else order["status"],
+                actor=actor,
+                on_behalf_of=on_behalf_of,
+                occurred_at=now,
+                details={
+                    "refund_id": refund_id,
+                    "amount_paise": refund.amount_paise,
+                    "reason": refund.reason,
+                },
+            )
     except sqlite3.IntegrityError as error:
         if "refunds.order_id" not in str(error) and "refunds.idempotency_key" not in str(error):
             raise  # some other constraint failed: a server bug, not a duplicate refund
@@ -356,14 +394,14 @@ def create_refund(
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     logger.info(
-        "refund_created order_id=%s refund_id=%s amount_paise=%s reason=%s status=%s",
-        order_id, cursor.lastrowid, refund.amount_paise, refund.reason, status,
+        "refund_created order_id=%s refund_id=%s amount_paise=%s reason=%s status=%s actor=%s",
+        order_id, refund_id, refund.amount_paise, refund.reason, status, actor,
     )
-    return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (refund_id,)).fetchone())
 
 
 @app.post("/orders/{order_id}/cancel", response_model=Order)
-def cancel_order(order_id: int, conn: DbConn):
+def cancel_order(order_id: int, conn: DbConn, now: Now, actor: Actor, on_behalf_of: OnBehalfOf):
     """Cancel an order that has not shipped yet, and return it.
 
     Cancelling an order that is already cancelled changes nothing and returns it,
@@ -383,8 +421,20 @@ def cancel_order(order_id: int, conn: DbConn):
             "UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'placed'",
             (order_id,),
         )
+        # rowcount 0 means it was already cancelled (or just shipped): nothing changed, no event.
+        if cursor.rowcount == 1:
+            record_event(
+                conn,
+                order_id=order_id,
+                event_type="cancelled",
+                from_status="placed",
+                to_status="cancelled",
+                actor=actor,
+                on_behalf_of=on_behalf_of,
+                occurred_at=now,
+            )
     if cursor.rowcount == 1:  # only log when this request actually changed the order
-        logger.info("order_cancelled order_id=%s", order_id)
+        logger.info("order_cancelled order_id=%s actor=%s", order_id, actor)
 
     order = load_order(conn, order_id)
     if order["status"] != "cancelled":  # it changed after we read it, e.g. it just shipped

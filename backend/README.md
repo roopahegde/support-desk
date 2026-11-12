@@ -232,8 +232,9 @@ backend/
 
 - An approval workflow for `pending_approval` refunds (listing them, then approving or rejecting them).
 - An endpoint that checks refund eligibility **without** creating a refund (planned with the MCP layer).
-- Order history: the append-only `order_events` table exists, but endpoints don't write to it yet,
-  and there is no endpoint to read it (planned next).
+- Reading order history: refunds and cancellations are recorded in the append-only `order_events`
+  table (who, on whose behalf, when, and the request ID), but there is no endpoint to read it yet,
+  and seeded orders have no history (planned next).
 - Ownership checks: any client with a valid key can read or change any customer's orders.
 - Production concerns: a server database such as PostgreSQL with migrations, a secrets manager
   instead of `.env`, HTTPS and rate limiting.
