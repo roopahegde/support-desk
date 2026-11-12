@@ -8,6 +8,10 @@ from pydantic import BaseModel, Field
 OrderStatus = Literal["placed", "shipped", "delivered", "cancelled", "refunded"]
 RefundReason = Literal["damaged", "wrong_item", "not_as_described", "changed_mind"]
 RefundStatus = Literal["completed", "pending_approval"]
+# Must match the CHECK constraint on order_events.event_type in db.py.
+EventType = Literal[
+    "placed", "shipped", "delivered", "cancelled", "refund_completed", "refund_pending_approval"
+]
 
 
 class OrderItem(BaseModel):
