@@ -1,5 +1,6 @@
 """API tests: real HTTP-style requests through TestClient, against a temporary database."""
 
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -7,11 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.db import connect, init_db
-from backend.app.main import app, get_db, get_now
+from backend.app.main import app, get_db, get_now, parse_api_keys, require_api_key
 from backend.app.seed import seed
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 TEST_API_KEY = "test-key"  # not a real secret: it only exists while a test runs
+TEST_ACTOR = "staff:test"  # the client that TEST_API_KEY belongs to
 
 
 @pytest.fixture
@@ -29,7 +31,7 @@ def db_path(tmp_path):
 def anonymous_client(db_path, monkeypatch):
     """A client that sends no API key, using the temporary database, never support_desk.db."""
     # monkeypatch undoes this after the test, and the tests never depend on a .env file.
-    monkeypatch.setenv("BACKEND_API_KEY", TEST_API_KEY)
+    monkeypatch.setenv("BACKEND_API_KEYS", f"{TEST_ACTOR}={TEST_API_KEY}")
 
     def get_test_db():
         conn = connect(db_path)
@@ -526,6 +528,8 @@ def test_wrong_api_key_gets_the_same_401_as_a_missing_one(anonymous_client):
     "path",
     [
         "/orders/1042",
+        "/orders/1042/events",
+        "/orders/1042/refund-eligibility?reason=damaged&amount_paise=100",
         "/customers/1/orders",
         "/products/SPK-200/stock",
         "/policies/refund",
@@ -548,7 +552,7 @@ def test_invalid_id_without_a_key_gets_401_not_validation_details(anonymous_clie
 
 
 def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
-    monkeypatch.delenv("BACKEND_API_KEY")
+    monkeypatch.delenv("BACKEND_API_KEYS")
     response = client.get("/orders/1042")
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "server_misconfigured"
@@ -557,9 +561,9 @@ def test_server_with_no_key_configured_rejects_requests(client, monkeypatch):
 
 
 def test_missing_server_key_is_logged_for_the_operator(client, monkeypatch, caplog):
-    monkeypatch.delenv("BACKEND_API_KEY")
+    monkeypatch.delenv("BACKEND_API_KEYS")
     client.get("/orders/1042")
-    assert "BACKEND_API_KEY is not set" in caplog.text  # caplog: pytest's capture of log output
+    assert "BACKEND_API_KEYS is not set" in caplog.text  # caplog: pytest's capture of log output
 
 
 def test_env_file_is_found_from_the_code_not_the_current_directory():
@@ -569,7 +573,7 @@ def test_env_file_is_found_from_the_code_not_the_current_directory():
 
 
 def test_server_with_an_empty_key_is_misconfigured(anonymous_client, monkeypatch):
-    monkeypatch.setenv("BACKEND_API_KEY", "")
+    monkeypatch.setenv("BACKEND_API_KEYS", "")
     assert anonymous_client.get("/orders/1042").status_code == 500
     assert anonymous_client.get("/orders/1042", headers={"X-API-Key": ""}).status_code == 500
 
@@ -588,6 +592,56 @@ def test_docs_stay_public(anonymous_client):
 def test_swagger_advertises_the_api_key_header(anonymous_client):
     schemes = anonymous_client.get("/openapi.json").json()["components"]["securitySchemes"]
     assert schemes["APIKeyHeader"] == {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+
+
+# --- One key per client: who is calling ---
+
+
+def test_api_keys_setting_maps_each_key_to_its_client():
+    keys = parse_api_keys("agent:support-desk=key-a, staff:roopa=key-b,")  # spaces, trailing comma
+    assert keys == {"key-a": "agent:support-desk", "key-b": "staff:roopa"}
+
+
+def test_a_key_may_contain_an_equals_sign():
+    assert parse_api_keys("staff:roopa=abc=def") == {"abc=def": "staff:roopa"}
+
+
+@pytest.mark.parametrize("setting", ["no-separator", "=key-without-actor", "actor-without-key="])
+def test_malformed_api_keys_setting_is_rejected(setting):
+    with pytest.raises(ValueError, match="entry 1 is not in the form actor=key"):
+        parse_api_keys(setting)
+
+
+def test_one_key_for_two_clients_is_rejected_without_revealing_it():
+    with pytest.raises(ValueError, match="entry 2 reuses a key") as problem:
+        parse_api_keys("staff:a=shared-secret,staff:b=shared-secret")
+    assert "shared-secret" not in str(problem.value)  # this message goes into the log
+
+
+def test_each_client_is_recognised_by_its_own_key(monkeypatch):
+    # A dependency is a plain function, so it can be called directly, without HTTP.
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    assert require_api_key("key-a") == "agent:support-desk"
+    assert require_api_key("key-b") == "staff:roopa"
+
+
+def test_every_configured_client_can_call_the_api(anonymous_client, monkeypatch):
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    for key in ("key-a", "key-b"):
+        assert anonymous_client.get("/orders/1042", headers={"X-API-Key": key}).status_code == 200
+    assert anonymous_client.get("/orders/1042", headers={"X-API-Key": "key-c"}).status_code == 401
+
+
+def test_malformed_server_setting_fails_closed_and_tells_the_operator(
+    anonymous_client, monkeypatch, caplog
+):
+    monkeypatch.setenv("BACKEND_API_KEYS", f"{TEST_ACTOR}={TEST_API_KEY},oops")
+    response = anonymous_client.get("/orders/1042", headers={"X-API-Key": TEST_API_KEY})
+    # Even the correct key is refused: a half-readable setting is not trusted at all.
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "server_misconfigured"
+    assert "BACKEND_API_KEYS is invalid (entry 2 is not in the form actor=key)" in caplog.text
+    assert TEST_API_KEY not in caplog.text
 
 
 # --- One error format everywhere ---
@@ -741,3 +795,255 @@ def test_order_that_ships_mid_request_is_not_cancelled(client, db_path):
     status = conn.execute("SELECT status FROM orders WHERE id = 1048").fetchone()[0]
     conn.close()
     assert status == "shipped"  # the shipment won; the order was not cancelled
+
+
+# --- Audit trail: every change writes one order_events row, in the same transaction ---
+
+
+def api_events(db_path, order_id):
+    """The order's audit events written by API requests (not the history the seed adds)."""
+    conn = connect(db_path)
+    rows = conn.execute(
+        "SELECT * FROM order_events WHERE order_id = ? AND actor != 'system:seed' ORDER BY id",
+        (order_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def order_status(db_path, order_id):
+    conn = connect(db_path)
+    status = conn.execute("SELECT status FROM orders WHERE id = ?", (order_id,)).fetchone()[0]
+    conn.close()
+    return status
+
+
+def block_event_writes(db_path):
+    """Make every INSERT into order_events fail, to prove the change it records is undone too."""
+    run_sql(
+        db_path,
+        "CREATE TRIGGER block_events BEFORE INSERT ON order_events"
+        " BEGIN SELECT RAISE(ABORT, 'simulated failure'); END",
+    )
+
+
+def crash_visible_client():
+    """A client that sees the 500 a real caller would get, instead of the Python error."""
+    return TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": TEST_API_KEY})
+
+
+def test_refund_records_one_event_saying_who_did_what(client, db_path):
+    response = client.post(
+        "/orders/1042/refunds",
+        json=VALID_REFUND,
+        headers={"Idempotency-Key": "key-1", "X-On-Behalf-Of": "customer:1"},
+    )
+    [event] = api_events(db_path, 1042)  # unpacking fails unless there is exactly one
+    assert event["event_type"] == "refund_completed"
+    assert (event["from_status"], event["to_status"]) == ("delivered", "refunded")
+    assert event["actor"] == TEST_ACTOR  # from the API key
+    assert event["on_behalf_of"] == "customer:1"  # from the header, stored as given
+    assert event["request_id"] == response.headers["X-Request-ID"]  # joins to the log
+    assert event["occurred_at"] == NOW.isoformat(timespec="seconds")
+    assert json.loads(event["details"]) == {
+        "refund_id": response.json()["id"], "amount_paise": 349_900, "reason": "damaged"
+    }
+
+
+def test_pending_refund_event_shows_the_order_did_not_change(client, db_path):
+    post_refund(client, order_id=1044, body={"reason": "damaged", "amount_paise": 5_499_900})
+    [event] = api_events(db_path, 1044)
+    assert event["event_type"] == "refund_pending_approval"
+    assert (event["from_status"], event["to_status"]) == ("delivered", "delivered")
+
+
+def test_retried_refund_adds_no_second_event(client, db_path):
+    post_refund(client, key="key-1")
+    post_refund(client, key="key-1")  # a replay: returns the original, changes nothing
+    assert len(api_events(db_path, 1042)) == 1
+
+
+@pytest.mark.parametrize("order_id", [1043, 1045])  # 422 outside the window; 409 already refunded
+def test_refused_refund_records_no_event(client, db_path, order_id):
+    assert post_refund(client, order_id=order_id).status_code in (409, 422)
+    assert api_events(db_path, order_id) == []  # refusals belong in the log, not the history
+
+
+def test_cancel_records_one_event_and_a_repeat_adds_none(client, db_path):
+    client.post("/orders/1048/cancel")
+    client.post("/orders/1048/cancel")  # already cancelled: a no-op
+    [event] = api_events(db_path, 1048)
+    assert event["event_type"] == "cancelled"
+    assert (event["from_status"], event["to_status"]) == ("placed", "cancelled")
+    assert event["actor"] == TEST_ACTOR
+    assert event["occurred_at"] == NOW.isoformat(timespec="seconds")  # cancel uses the clock too
+
+
+def test_refused_cancel_records_no_event(client, db_path):
+    assert client.post("/orders/1047/cancel").status_code == 422  # already shipped
+    assert api_events(db_path, 1047) == []
+
+
+def test_failed_event_write_undoes_the_refund(client, db_path):
+    block_event_writes(db_path)
+    assert post_refund(crash_visible_client()).status_code == 500
+    assert count_refunds(db_path, 1042) == 0  # no refund without its audit record...
+    assert order_status(db_path, 1042) == "delivered"  # ...and no status change either
+
+
+def test_failed_event_write_undoes_the_cancel(client, db_path):
+    block_event_writes(db_path)
+    assert crash_visible_client().post("/orders/1048/cancel").status_code == 500
+    assert order_status(db_path, 1048) == "placed"
+
+
+def test_actor_comes_from_the_key_that_was_used(anonymous_client, db_path, monkeypatch):
+    monkeypatch.setenv("BACKEND_API_KEYS", "agent:support-desk=key-a,staff:roopa=key-b")
+    anonymous_client.post("/orders/1048/cancel", headers={"X-API-Key": "key-a"})
+    assert api_events(db_path, 1048)[0]["actor"] == "agent:support-desk"
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-On-Behalf-Of": "   "}])
+def test_on_behalf_of_is_optional_and_blank_means_none(client, db_path, headers):
+    client.post("/orders/1048/cancel", headers=headers)
+    assert api_events(db_path, 1048)[0]["on_behalf_of"] is None
+
+
+def test_oversized_on_behalf_of_is_rejected_and_changes_nothing(client, db_path):
+    response = client.post("/orders/1048/cancel", headers={"X-On-Behalf-Of": "c" * 101})
+    assert response.status_code == 422
+    assert response.json()["error"]["fields"][0]["location"] == "header.x-on-behalf-of"
+    assert order_status(db_path, 1048) == "placed"
+
+
+# --- GET /orders/{id}/events ---
+
+
+def test_order_events_show_the_seeded_history_oldest_first(client):
+    response = client.get("/orders/1045/events")
+    assert response.status_code == 200
+    events = response.json()
+    assert [e["event_type"] for e in events] == ["placed", "shipped", "delivered", "refund_completed"]
+    assert events[0]["occurred_at"] == (NOW - timedelta(days=18)).isoformat().replace("+00:00", "Z")
+    assert events[-1]["details"]["amount_paise"] == 129_900  # a JSON object, not a string
+
+
+def test_order_events_include_changes_made_through_the_api(client):
+    client.post("/orders/1048/cancel", headers={"X-On-Behalf-Of": "customer:1"})
+    events = client.get("/orders/1048/events").json()
+    assert [e["event_type"] for e in events] == ["placed", "cancelled"]
+    cancelled = events[-1]
+    assert cancelled["actor"] == TEST_ACTOR
+    assert cancelled["on_behalf_of"] == "customer:1"
+    assert cancelled["request_id"] is not None and cancelled["details"] is None
+
+
+def test_order_events_of_unknown_order_returns_404(client):
+    response = client.get("/orders/9999/events")
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "Order 9999 not found")
+
+
+def test_reading_order_events_records_nothing(client):
+    client.get("/orders/1042/events")
+    assert len(client.get("/orders/1042/events").json()) == 3  # reads are not changes
+
+
+# --- GET /orders/{id}/refund-eligibility ---
+
+
+def ask_eligibility(client, order_id=1042, reason="damaged", amount_paise=349_900):
+    return client.get(
+        f"/orders/{order_id}/refund-eligibility",
+        params={"reason": reason, "amount_paise": amount_paise},
+    )
+
+
+def test_eligible_refund_is_answered_with_eligible(client):
+    response = ask_eligibility(client)
+    assert response.status_code == 200
+    assert response.json() == {
+        "order_id": 1042, "reason": "damaged", "amount_paise": 349_900,
+        "outcome": "eligible", "code": None,
+        "message": "A refund of 349900 paise for order 1042 (reason 'damaged') is allowed"
+        " and would be paid immediately if requested now.",
+    }
+
+
+def test_large_refund_is_answered_with_needs_approval(client):
+    answer = ask_eligibility(client, order_id=1044, amount_paise=5_499_900).json()
+    assert answer["outcome"] == "needs_approval"
+    assert "a human must approve it" in answer["message"]
+
+
+def test_refused_refund_is_an_answer_not_an_error(client):
+    response = ask_eligibility(client, order_id=1043, amount_paise=219_900)
+    assert response.status_code == 200  # "no" is a valid answer to "would this be allowed?"
+    assert response.json()["outcome"] == "not_eligible"
+    assert response.json()["code"] == "policy_violation"
+
+
+# Every rule, with the outcome the real refund endpoint must agree with.
+SCENARIOS = [
+    (1042, "damaged", 349_900),  # eligible
+    (1044, "damaged", 5_499_900),  # needs approval: above INR 10,000
+    (1043, "damaged", 219_900),  # outside the 30-day window
+    (1047, "damaged", 249_900),  # not delivered yet
+    (1049, "changed_mind", 249_900),  # changed_mind after 7 days
+    (1042, "damaged", 349_901),  # more than the order total
+    (1045, "damaged", 129_900),  # already refunded
+]
+
+
+@pytest.mark.parametrize(("order_id", "reason", "amount_paise"), SCENARIOS)
+def test_eligibility_answer_matches_what_the_refund_endpoint_does(
+    client, order_id, reason, amount_paise
+):
+    answer = ask_eligibility(client, order_id, reason, amount_paise).json()
+    body = {"reason": reason, "amount_paise": amount_paise}
+    refund = post_refund(client, order_id=order_id, body=body, key=f"contract-{order_id}")
+
+    if answer["outcome"] == "not_eligible":
+        # Refused for the same reason, in the same words.
+        assert refund.status_code in (409, 422)
+        assert refund.json()["error"] == {"code": answer["code"], "message": answer["message"]}
+    else:
+        expected = "completed" if answer["outcome"] == "eligible" else "pending_approval"
+        assert refund.status_code == 201
+        assert refund.json()["status"] == expected
+
+
+def test_pending_refund_makes_the_order_not_eligible(client):
+    post_refund(client, order_id=1044, body={"reason": "damaged", "amount_paise": 5_499_900})
+    answer = ask_eligibility(client, order_id=1044, amount_paise=5_499_900).json()
+    assert answer["outcome"] == "not_eligible"
+    assert answer["code"] == "refund_pending_approval"
+
+
+def test_asking_about_eligibility_changes_nothing(client, db_path):
+    for order_id, reason, amount_paise in SCENARIOS:
+        ask_eligibility(client, order_id, reason, amount_paise)
+    assert count_refunds(db_path, 1042) == 0 and count_refunds(db_path, 1044) == 0
+    assert order_status(db_path, 1042) == "delivered"
+    assert api_events(db_path, 1042) == [] and api_events(db_path, 1044) == []
+
+
+def test_eligibility_of_unknown_order_returns_404(client):
+    response = ask_eligibility(client, order_id=9999)
+    assert response.status_code == 404
+    assert response.json() == error("not_found", "Order 9999 not found")
+
+
+@pytest.mark.parametrize(
+    ("params", "field"),
+    [
+        ({"amount_paise": 100}, "query.reason"),  # reason missing
+        ({"reason": "bored", "amount_paise": 100}, "query.reason"),  # not an accepted reason
+        ({"reason": "damaged"}, "query.amount_paise"),  # amount missing
+        ({"reason": "damaged", "amount_paise": 0}, "query.amount_paise"),  # must be above zero
+    ],
+)
+def test_invalid_eligibility_question_returns_422(client, params, field):
+    response = client.get("/orders/1042/refund-eligibility", params=params)
+    assert response.status_code == 422
+    assert [f["location"] for f in response.json()["error"]["fields"]] == [field]

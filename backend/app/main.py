@@ -4,6 +4,7 @@ Run from the repo root:  python -m uvicorn backend.app.main:app --reload
 Swagger UI (interactive docs):  http://127.0.0.1:8000/docs
 """
 
+import json
 import logging
 import os
 import secrets
@@ -16,13 +17,23 @@ from pathlib import Path
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, Request, Response
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.security import APIKeyHeader
 
+from backend.app.audit import record_event
 from backend.app.db import connect
 from backend.app.errors import ERROR_RESPONSES, ApiError, register_error_handlers
 from backend.app.logging_config import configure_logging, request_id_var
-from backend.app.models import Order, ProductStock, Refund, RefundPolicy, RefundRequest
+from backend.app.models import (
+    Order,
+    OrderEvent,
+    ProductStock,
+    Refund,
+    RefundEligibility,
+    RefundPolicy,
+    RefundReason,
+    RefundRequest,
+)
 from backend.app.policy import REFUND_POLICY
 from backend.app.rules import PolicyViolation, check_cancellable, evaluate_refund
 
@@ -37,22 +48,80 @@ configure_logging()  # console or file, chosen by LOG_TARGET in backend/.env
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> None:
-    """Reject the request unless it carries the correct X-API-Key header."""
-    expected = os.environ.get("BACKEND_API_KEY")
-    # A missing or empty key is a server misconfiguration: fail closed, for every request.
-    if not expected:
-        # The log tells the operator how to fix it. The client only learns it is not at fault.
-        logger.error("BACKEND_API_KEY is not set: add it to %s or the environment", ENV_FILE)
-        raise ApiError(
-            500,
-            "server_misconfigured",
-            "The server's API-key check is not configured, so no request can be"
-            " authorized. This is a server problem, not a problem with your API key.",
-        )
-    # Compare bytes: compare_digest raises an error on str values with non-ASCII characters.
-    if api_key is None or not secrets.compare_digest(api_key.encode(), expected.encode()):
-        raise ApiError(401, "unauthorized", "Invalid API key")
+def parse_api_keys(value: str) -> dict[str, str]:
+    """Turn "actor=key,actor=key" into {key: actor}. Raises ValueError if it is malformed.
+
+    Error messages name the entry's position, never its content: they are logged, and
+    the content contains a key.
+    """
+    keys: dict[str, str] = {}
+    entries = [entry.strip() for entry in value.split(",")]
+    for position, entry in enumerate(entries, start=1):
+        if not entry:
+            continue  # tolerate a trailing comma or blank entry
+        actor, separator, key = entry.partition("=")  # split at the FIRST "=" only
+        if not separator or not actor.strip() or not key.strip():
+            raise ValueError(f"entry {position} is not in the form actor=key")
+        if key.strip() in keys:
+            raise ValueError(f"entry {position} reuses a key that another client already has")
+        keys[key.strip()] = actor.strip()
+    return keys
+
+
+def server_misconfigured() -> ApiError:
+    """The 500 a client gets when the server's own key setup is broken."""
+    # The client only learns it is not at fault. The log, written by the caller, says why.
+    return ApiError(
+        500,
+        "server_misconfigured",
+        "The server's API-key check is not configured, so no request can be"
+        " authorized. This is a server problem, not a problem with your API key.",
+    )
+
+
+def require_api_key(api_key: Annotated[str | None, Depends(api_key_header)]) -> str:
+    """Return the client ("actor") whose key is in the X-API-Key header, or reject the request."""
+    try:
+        keys = parse_api_keys(os.environ.get("BACKEND_API_KEYS", ""))
+    except ValueError as problem:
+        logger.error("BACKEND_API_KEYS is invalid (%s): fix it in %s", problem, ENV_FILE)
+        raise server_misconfigured() from None
+    # No keys at all is a server misconfiguration: fail closed, for every request.
+    if not keys:
+        logger.error("BACKEND_API_KEYS is not set: add it to %s or the environment", ENV_FILE)
+        raise server_misconfigured()
+    if api_key is not None:
+        # Check every key, without stopping at a match, so response time doesn't hint at which
+        # client's key was close. Compare bytes: compare_digest rejects non-ASCII str values.
+        matches = [
+            actor for key, actor in keys.items()
+            if secrets.compare_digest(api_key.encode(), key.encode())
+        ]
+        if matches:
+            return matches[0]  # parse_api_keys guarantees there is at most one
+    raise ApiError(401, "unauthorized", "Invalid API key")
+
+
+# An endpoint parameter of this type receives the caller's actor name, e.g. "agent:support-desk".
+# The app-wide dependency below already ran require_api_key; FastAPI reuses that result.
+Actor = Annotated[str, Depends(require_api_key)]
+
+
+def get_on_behalf_of(
+    # FastAPI maps x_on_behalf_of to the X-On-Behalf-Of header. Optional: None when not sent.
+    x_on_behalf_of: Annotated[str | None, Header(max_length=100)] = None,
+) -> str | None:
+    """The end customer the caller says it is serving, e.g. "customer:1".
+
+    It is recorded in the audit trail but NOT verified: any caller can send any value.
+    Never use it to decide what a caller is allowed to do.
+    """
+    if x_on_behalf_of is None or not x_on_behalf_of.strip():
+        return None  # an empty header means the same as no header
+    return x_on_behalf_of.strip()
+
+
+OnBehalfOf = Annotated[str | None, Depends(get_on_behalf_of)]
 
 
 app = FastAPI(
@@ -134,6 +203,26 @@ def load_order(conn: sqlite3.Connection, order_id: int) -> dict:
         (order_id,),
     ).fetchall()
     return {**dict(order), "items": [dict(item) for item in items]}
+
+
+@app.get("/orders/{order_id}/events", response_model=list[OrderEvent])
+def get_order_events(order_id: int, conn: DbConn):
+    """Return the order's history, oldest first: every change, who made it, and when.
+
+    Responds with 404 if the order does not exist. on_behalf_of is shown exactly as the
+    caller stated it; it is not verified.
+    """
+    if conn.execute("SELECT 1 FROM orders WHERE id = ?", (order_id,)).fetchone() is None:
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
+    rows = conn.execute(
+        "SELECT * FROM order_events WHERE order_id = ? ORDER BY occurred_at, id",  # id breaks ties
+        (order_id,),
+    ).fetchall()
+    # details is stored as JSON text; return it as a real JSON object, not a string inside a string.
+    return [
+        {**dict(row), "details": json.loads(row["details"]) if row["details"] else None}
+        for row in rows
+    ]
 
 
 # response_model: FastAPI validates the return value against list[Order] and documents it in Swagger.
@@ -261,6 +350,51 @@ def replay_or_conflict(
     raise already_refunded_error(conn, order_id)
 
 
+def order_has_refund(conn: sqlite3.Connection, order_id: int) -> bool:
+    """True if the order already has a refund, completed or waiting for approval."""
+    return conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone() is not None
+
+
+@app.get("/orders/{order_id}/refund-eligibility", response_model=RefundEligibility)
+def check_refund_eligibility(
+    order_id: int,
+    reason: RefundReason,  # a query parameter: ?reason=damaged (any other value gets a 422)
+    amount_paise: Annotated[int, Query(gt=0)],  # ?amount_paise=349900
+    conn: DbConn,
+    now: Now,
+):
+    """Say whether a refund would be allowed right now, without creating one. Changes nothing.
+
+    Runs the same checks as POST /orders/{id}/refunds, in the same order. A refund the
+    policy forbids is a normal answer (200 with outcome not_eligible), not an error.
+    Responds with 404 if the order does not exist, and 422 if the query is invalid.
+    """
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if order is None:
+        raise ApiError(404, "not_found", f"Order {order_id} not found")
+    question = {"order_id": order_id, "reason": reason, "amount_paise": amount_paise}
+
+    if order_has_refund(conn, order_id):
+        refused = already_refunded_error(conn, order_id)  # the exact 409 the refund would get
+        return {**question, "outcome": "not_eligible", "code": refused.code,
+                "message": refused.message}
+    refund_request = RefundRequest(reason=reason, amount_paise=amount_paise)
+    try:
+        status = evaluate_refund(dict(order), refund_request, now)  # the same rule code as POST
+    except PolicyViolation as error:
+        return {**question, "outcome": "not_eligible", "code": "policy_violation",
+                "message": str(error)}
+
+    subject = f"A refund of {amount_paise} paise for order {order_id} (reason '{reason}')"
+    if status == "pending_approval":
+        limit = REFUND_POLICY.approval_threshold_paise
+        message = (f"{subject} is allowed, but it is above the {limit} paise limit, so a human"
+                   " must approve it before it is paid.")
+        return {**question, "outcome": "needs_approval", "code": None, "message": message}
+    return {**question, "outcome": "eligible", "code": None,
+            "message": f"{subject} is allowed and would be paid immediately if requested now."}
+
+
 @app.post("/orders/{order_id}/refunds", response_model=Refund, status_code=201)
 def create_refund(
     order_id: int,
@@ -269,6 +403,8 @@ def create_refund(
     idempotency_key: Annotated[str, Header(min_length=1, max_length=255)],
     conn: DbConn,
     now: Now,
+    actor: Actor,
+    on_behalf_of: OnBehalfOf,
 ):
     """Refund an order, if the refund policy allows it. Retries with the same key are safe.
 
@@ -288,7 +424,7 @@ def create_refund(
     if order is None:
         raise ApiError(404, "not_found", f"Order {order_id} not found")
     # Checked before the rules, so a refunded order gets "already refunded", not "not delivered".
-    if conn.execute("SELECT 1 FROM refunds WHERE order_id = ?", (order_id,)).fetchone():
+    if order_has_refund(conn, order_id):
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     try:
@@ -304,8 +440,26 @@ def create_refund(
                 " idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (order_id, refund.amount_paise, refund.reason, status, idempotency_key, created_at),
             )
+            refund_id = cursor.lastrowid
             if status == "completed":  # a pending refund leaves the order as it is
                 conn.execute("UPDATE orders SET status = 'refunded' WHERE id = ?", (order_id,))
+            # Same transaction: if this insert fails, the refund and status change are undone too.
+            # Replays never get here, so a retried request adds no second event.
+            record_event(
+                conn,
+                order_id=order_id,
+                event_type="refund_completed" if status == "completed" else "refund_pending_approval",
+                from_status=order["status"],
+                to_status="refunded" if status == "completed" else order["status"],
+                actor=actor,
+                on_behalf_of=on_behalf_of,
+                occurred_at=now,
+                details={
+                    "refund_id": refund_id,
+                    "amount_paise": refund.amount_paise,
+                    "reason": refund.reason,
+                },
+            )
     except sqlite3.IntegrityError as error:
         if "refunds.order_id" not in str(error) and "refunds.idempotency_key" not in str(error):
             raise  # some other constraint failed: a server bug, not a duplicate refund
@@ -315,14 +469,14 @@ def create_refund(
         return replay_or_conflict(conn, order_id, idempotency_key, refund)
 
     logger.info(
-        "refund_created order_id=%s refund_id=%s amount_paise=%s reason=%s status=%s",
-        order_id, cursor.lastrowid, refund.amount_paise, refund.reason, status,
+        "refund_created order_id=%s refund_id=%s amount_paise=%s reason=%s status=%s actor=%s",
+        order_id, refund_id, refund.amount_paise, refund.reason, status, actor,
     )
-    return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (cursor.lastrowid,)).fetchone())
+    return dict(conn.execute("SELECT * FROM refunds WHERE id = ?", (refund_id,)).fetchone())
 
 
 @app.post("/orders/{order_id}/cancel", response_model=Order)
-def cancel_order(order_id: int, conn: DbConn):
+def cancel_order(order_id: int, conn: DbConn, now: Now, actor: Actor, on_behalf_of: OnBehalfOf):
     """Cancel an order that has not shipped yet, and return it.
 
     Cancelling an order that is already cancelled changes nothing and returns it,
@@ -342,8 +496,20 @@ def cancel_order(order_id: int, conn: DbConn):
             "UPDATE orders SET status = 'cancelled' WHERE id = ? AND status = 'placed'",
             (order_id,),
         )
+        # rowcount 0 means it was already cancelled (or just shipped): nothing changed, no event.
+        if cursor.rowcount == 1:
+            record_event(
+                conn,
+                order_id=order_id,
+                event_type="cancelled",
+                from_status="placed",
+                to_status="cancelled",
+                actor=actor,
+                on_behalf_of=on_behalf_of,
+                occurred_at=now,
+            )
     if cursor.rowcount == 1:  # only log when this request actually changed the order
-        logger.info("order_cancelled order_id=%s", order_id)
+        logger.info("order_cancelled order_id=%s actor=%s", order_id, actor)
 
     order = load_order(conn, order_id)
     if order["status"] != "cancelled":  # it changed after we read it, e.g. it just shipped
